@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import BaseModel, Field, model_validator
 
 
@@ -16,6 +18,10 @@ class StartDetection(BaseModel):
 
 class SetVerification(BaseModel):
     verified: bool
+
+
+class SetReviewStatus(BaseModel):
+    status: Literal["needs_review", "verified", "rejected", "no_plate"]
 
 
 class StartTraining(BaseModel):

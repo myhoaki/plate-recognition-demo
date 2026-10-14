@@ -113,6 +113,7 @@ def run_detection_job(job_id: str):
                 db.add_all(new_annotations)
                 image.detection_complete = True
                 image.verified_at = None
+                image.review_status = "needs_review"
                 job.detected += bool(detections)
                 job.completed = min(job.completed + 1, job.total)
                 db.commit()

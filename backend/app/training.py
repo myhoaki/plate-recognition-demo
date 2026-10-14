@@ -29,7 +29,7 @@ def _prepare_dataset(job_id: str, config: dict, training_dir: Path) -> tuple[Pat
     with SessionLocal() as db:
         images = db.scalars(
             select(ImageRecord)
-            .where(ImageRecord.verified_at.is_not(None))
+            .where(ImageRecord.review_status == "verified", ImageRecord.verified_at.is_not(None))
             .order_by(ImageRecord.id)
         ).all()
         records = []

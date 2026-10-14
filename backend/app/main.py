@@ -11,9 +11,9 @@ from sqlalchemy.orm import Session, selectinload
 from . import models  # noqa: F401 - register ORM metadata
 from .celery_app import celery_app
 from .database import Base, SessionLocal, engine, get_db
-from .logic import annotation_payload, image_payload, import_legacy_records, iou, sync_raw_images
+from .logic import annotation_payload, image_payload, import_legacy_records, iou, metrics_payload, sync_raw_images
 from .models import Annotation, DetectionJob, ImageRecord, TrainingJob, utcnow
-from .schemas import SaveAnnotations, SetVerification, StartDetection, StartTraining
+from .schemas import SaveAnnotations, SetReviewStatus, SetVerification, StartDetection, StartTraining
 from .storage import RAW_IMAGES_DIR, UPLOADS_DIR, image_path, save_upload
 from .tasks import run_detection_job  # noqa: F401 - register Celery task
 from .training import run_training_job
@@ -65,6 +65,8 @@ async def lifespan(_app: FastAPI):
     Base.metadata.create_all(bind=engine)
     with engine.begin() as connection:
         connection.execute(text("ALTER TABLE images ADD COLUMN IF NOT EXISTS verified_at TIMESTAMPTZ"))
+        connection.execute(text("ALTER TABLE images ADD COLUMN IF NOT EXISTS review_status VARCHAR(20) NOT NULL DEFAULT 'needs_review'"))
+        connection.execute(text("UPDATE images SET review_status = 'verified' WHERE verified_at IS NOT NULL AND review_status = 'needs_review'"))
     with SessionLocal() as db:
         import_legacy_records(db)
     Thread(target=_run_raw_image_refresh, daemon=True).start()
@@ -80,17 +82,77 @@ def health(db: Session = Depends(get_db)):
     return {"status": "ok"}
 
 
+@app.get("/api/metrics")
+def dashboard_metrics(db: Session = Depends(get_db)):
+    return metrics_payload(db)
+
+
 @app.get("/api/images")
-def list_images(source: str = "rawimages", limit: int = 500, offset: int = 0, db: Session = Depends(get_db)):
+def list_images(
+    source: str = "rawimages",
+    limit: int = 500,
+    offset: int = 0,
+    review: str = "all",
+    threshold: float = 0.7,
+    review_status: str = "all",
+    db: Session = Depends(get_db),
+):
     if source not in {"rawimages", "upload"}:
         raise HTTPException(400, "Unsupported image source")
+    if review not in {"all", "detector", "ocr", "both"}:
+        raise HTTPException(400, "Unsupported confidence review filter")
+    if review_status not in {"all", "needs_review", "verified", "rejected", "no_plate"}:
+        raise HTTPException(400, "Unsupported image review status filter")
+    if not 0 <= threshold <= 1:
+        raise HTTPException(400, "Confidence threshold must be between 0 and 1")
     limit = min(max(limit, 1), 500)
     offset = max(offset, 0)
     query = select(ImageRecord).where(ImageRecord.source == source)
+    if review_status != "all":
+        query = query.where(ImageRecord.review_status == review_status)
+    detection_confidence = (
+        select(func.min(Annotation.detection_confidence))
+        .where(Annotation.image_id == ImageRecord.id, Annotation.ai_detection.is_(True))
+        .scalar_subquery()
+    )
+    ocr_confidence = (
+        select(func.min(Annotation.ocr_confidence))
+        .where(Annotation.image_id == ImageRecord.id, Annotation.ai_detection.is_(True))
+        .scalar_subquery()
+    )
+    if review == "detector":
+        query = query.where(detection_confidence.is_not(None), detection_confidence <= threshold)
+        confidence_order = detection_confidence
+    elif review == "ocr":
+        query = query.where(ocr_confidence.is_not(None), ocr_confidence <= threshold)
+        confidence_order = ocr_confidence
+    elif review == "both":
+        query = query.where(
+            (detection_confidence.is_not(None) & (detection_confidence <= threshold))
+            | (ocr_confidence.is_not(None) & (ocr_confidence <= threshold))
+        )
+        confidence_order = func.least(
+            func.coalesce(detection_confidence, 2.0),
+            func.coalesce(ocr_confidence, 2.0),
+        )
+    else:
+        confidence_order = func.least(
+            func.coalesce(detection_confidence, 2.0),
+            func.coalesce(ocr_confidence, 2.0),
+        )
     total = db.scalar(select(func.count()).select_from(query.subquery())) or 0
     rows = db.scalars(
         query
-        .order_by(ImageRecord.original_filename.collate("C"))
+        .order_by(
+            case(
+                (ImageRecord.review_status == "needs_review", 0),
+                (ImageRecord.review_status == "rejected", 1),
+                (ImageRecord.review_status == "no_plate", 2),
+                else_=3,
+            ),
+            confidence_order.asc().nulls_last(),
+            ImageRecord.original_filename.collate("C"),
+        )
         .offset(offset)
         .limit(limit)
     ).all()
@@ -131,6 +193,7 @@ async def upload_image(file: UploadFile = File(...), db: Session = Depends(get_d
         image.storage_key = f"uploads/{storage_key}"
         image.detection_complete = False
         image.verified_at = None
+        image.review_status = "needs_review"
         image_id = image.id
         db.commit()
         if old_path != path:
@@ -172,6 +235,18 @@ def set_image_verification(image_id: str, payload: SetVerification, db: Session 
     if not image:
         raise HTTPException(404, "Image not found")
     image.verified_at = utcnow() if payload.verified else None
+    image.review_status = "verified" if payload.verified else "needs_review"
+    db.commit()
+    return {"image": image_payload(image)}
+
+
+@app.post("/api/images/{image_id}/review-status")
+def set_image_review_status(image_id: str, payload: SetReviewStatus, db: Session = Depends(get_db)):
+    image = db.get(ImageRecord, image_id)
+    if not image:
+        raise HTTPException(404, "Image not found")
+    image.review_status = payload.status
+    image.verified_at = utcnow() if payload.status == "verified" else None
     db.commit()
     return {"image": image_payload(image)}
 
@@ -215,12 +290,12 @@ def save_annotations(image_id: str, payload: SaveAnnotations, db: Session = Depe
             score = iou(bounds, ai.bbox_xyxy_pixels)
             if score > overlap:
                 candidate, overlap = (index, ai), score
-        matched = candidate[1] if candidate and overlap >= 0.15 else None
+        matched = candidate[1] if candidate and overlap >= 0.5 else None
         if matched:
             used_ai.add(candidate[0])
-        text_value = item.verified_result.strip() or (matched.ai_result if matched else "")
+        text_value = item.verified_result.strip()
         if not text_value:
-            raise HTTPException(400, "Enter the plate text or accept a matching AI guess")
+            raise HTTPException(400, "Enter the verified plate text; OCR guesses are not saved as ground truth automatically")
         output.append(
             Annotation(
                 image_id=image.id,
@@ -245,6 +320,7 @@ def save_annotations(image_id: str, payload: SaveAnnotations, db: Session = Depe
     db.flush()
     db.add_all(output)
     image.verified_at = None
+    image.review_status = "needs_review"
     db.commit()
     db.refresh(image)
     return {"image": image_payload(image, include_annotations=True)}

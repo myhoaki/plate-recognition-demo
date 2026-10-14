@@ -26,6 +26,7 @@ class ImageRecord(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
     detection_complete: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    review_status: Mapped[str] = mapped_column(String(20), default="needs_review", server_default="needs_review", nullable=False)
     annotations: Mapped[list["Annotation"]] = relationship(back_populates="image", cascade="all, delete-orphan")
 
 

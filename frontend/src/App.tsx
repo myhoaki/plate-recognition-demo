@@ -1,5 +1,5 @@
 import { Fragment, type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Image as KImage, Layer, Rect, Stage, Text } from 'react-konva';
+import { Circle, Image as KImage, Layer, Rect, Stage, Text } from 'react-konva';
 import type Konva from 'konva';
 
 type Annotation = {
@@ -7,9 +7,11 @@ type Annotation = {
   verified_result?: string | null; detection_confidence?: number | null; ocr_confidence?: number | null;
   country?: string | null; country_confidence?: number | null;
 };
-type ImageRecord = { id: string; filename: string; width: number; height: number; detection_complete: boolean; verified: boolean; verified_at?: string | null; file_url: string; annotations?: Annotation[] };
+type ReviewStatus = 'needs_review' | 'verified' | 'rejected' | 'no_plate';
+type ImageRecord = { id: string; filename: string; width: number; height: number; detection_complete: boolean; verified: boolean; review_status: ReviewStatus; verified_at?: string | null; file_url: string; annotations?: Annotation[] };
 type Job = { job_id?: string; id?: string; kind?: 'single' | 'batch'; status: string; total: number; completed: number; detected: number; failed: number; error?: string | null; existing?: boolean };
 type TrainingJob = { id: string; status: string; config: { epochs: number; batch_size: number; image_size: number; device: string }; split_counts: Record<string, number>; current_epoch: number; total_epochs: number; metrics: Record<string, number>; model_ready: boolean; error?: string | null };
+type DashboardMetrics = { total_images: number; verified_plates: number; images_needing_review: number; ocr_evaluated_plates: number; ocr_exact_match_accuracy: number | null; character_error_rate: number | null; detection_evaluated_plates: number; detection_recall: number | null };
 type RefreshState = { running: boolean; processed: number; total: number; added_or_changed: number; error?: string | null };
 type Box = { bbox_xyxy_pixels: number[]; verified_result: string; ai_detection: boolean; ai_result?: string | null; detection_confidence?: number | null; ocr_confidence?: number | null; country?: string | null; country_confidence?: number | null };
 const PAGE_SIZE = 500;
@@ -49,6 +51,10 @@ export default function App() {
   const [pageOffset, setPageOffset] = useState(0);
   const [jumpOrder, setJumpOrder] = useState('1');
   const [source, setSource] = useState<'rawimages' | 'upload'>('rawimages');
+  const [confidenceReview, setConfidenceReview] = useState<'all' | 'detector' | 'ocr' | 'both'>('all');
+  const [confidenceThreshold, setConfidenceThreshold] = useState(0.7);
+  const [statusFilter, setStatusFilter] = useState<'all' | ReviewStatus>('all');
+  const [filteringImages, setFilteringImages] = useState(false);
   const [boxes, setBoxes] = useState<Box[]>([]);
   const [imageEl, setImageEl] = useState<HTMLImageElement | null>(null);
   const [stageSize, setStageSize] = useState({ width: 800, height: 520 });
@@ -58,10 +64,14 @@ export default function App() {
   const [message, setMessage] = useState('');
   const [job, setJob] = useState<Job | null>(null);
   const [activeJobs, setActiveJobs] = useState<Job[]>([]);
+  const [dashboardMetrics, setDashboardMetrics] = useState<DashboardMetrics | null>(null);
   const [trainingJob, setTrainingJob] = useState<TrainingJob | null>(null);
   const [showTrainingForm, setShowTrainingForm] = useState(false);
   const [trainingConfig, setTrainingConfig] = useState({ epochs: 30, batch_size: 8, image_size: 640, device: 'auto' });
   const [drawing, setDrawing] = useState<number[] | null>(null);
+  const [selectedBoxIndex, setSelectedBoxIndex] = useState<number | null>(null);
+  const ocrInputRefs = useRef<Array<HTMLInputElement | null>>([]);
+  const imageLoadSequence = useRef(0);
   const stageRef = useRef<Konva.Stage>(null);
   const current = images[index];
   const jobActive = job?.status === 'queued' || job?.status === 'running';
@@ -130,13 +140,23 @@ export default function App() {
   }, [current?.id, pageOffset, index]);
 
   const loadImages = useCallback(async (src = source, preferredId?: string, offset = 0) => {
-    const data = await api<{ images: ImageRecord[]; total: number }>(`/api/images?source=${src}&limit=${PAGE_SIZE}&offset=${offset}`);
+    const requestId = ++imageLoadSequence.current;
+    const params = new URLSearchParams({ source: src, limit: String(PAGE_SIZE), offset: String(offset), review: confidenceReview, threshold: String(confidenceThreshold), review_status: statusFilter });
+    const data = await api<{ images: ImageRecord[]; total: number }>(`/api/images?${params}`);
+    if (requestId !== imageLoadSequence.current) return;
     setImages(data.images);
     setImageTotal(data.total);
     setPageOffset(offset);
     const nextIndex = preferredId ? data.images.findIndex((item) => item.id === preferredId) : -1;
     setIndex(nextIndex >= 0 ? nextIndex : 0);
-  }, [source]);
+  }, [source, confidenceReview, confidenceThreshold, statusFilter]);
+
+  const loadMetrics = useCallback(async () => {
+    try { setDashboardMetrics(await api<DashboardMetrics>('/api/metrics')); }
+    catch { /* Keep the last successful metrics if a refresh fails. */ }
+  }, []);
+
+  useEffect(() => { void loadMetrics(); }, [loadMetrics]);
 
   useEffect(() => {
     if (!job?.id || (job.status !== 'queued' && job.status !== 'running')) return;
@@ -155,6 +175,7 @@ export default function App() {
         window.localStorage.removeItem('platelens.activeDetectionJob');
         setMessage(`Detection ${state.status}: ${state.completed}/${state.total} images, ${state.detected} with plates, ${state.failed} failed.`);
         await loadImages(source, current?.id, pageOffset);
+        void loadMetrics();
         if (current) {
           const detail = await api<ImageRecord>(`/api/images/${current.id}`);
           if (!cancelled) setBoxes((detail.annotations || []).map((a) => ({ ...a, verified_result: a.verified_result || '' })));
@@ -168,10 +189,19 @@ export default function App() {
     };
     timer = window.setTimeout(poll, 900);
     return () => { cancelled = true; window.clearTimeout(timer); };
-  }, [job?.id, job?.status, source, pageOffset, current?.id, loadImages]);
+  }, [job?.id, job?.status, source, pageOffset, current?.id, loadImages, loadMetrics]);
 
-  useEffect(() => { loadImages().catch((e) => setMessage(e.message)); }, [loadImages]);
   useEffect(() => {
+    let active = true;
+    setFilteringImages(true);
+    loadImages().catch((e) => setMessage(e.message)).finally(() => {
+      if (active) setFilteringImages(false);
+    });
+    return () => { active = false; };
+  }, [loadImages]);
+  useEffect(() => {
+    setSelectedBoxIndex(null);
+    ocrInputRefs.current = [];
     if (!current) { setImageEl(null); setBoxes([]); return; }
     setDirtyImageId(null);
     let cancelled = false;
@@ -236,6 +266,7 @@ export default function App() {
       const form = new FormData(); form.append('file', file);
       const created = await api<ImageRecord>('/api/images/upload', { method: 'POST', body: form });
       setSource('upload'); await loadImages('upload', created.id); setMessage('Image uploaded.');
+      void loadMetrics();
     } catch (e) { setMessage((e as Error).message); } finally { setBusy(false); }
   };
   const refresh = async () => {
@@ -250,6 +281,7 @@ export default function App() {
       }
       if (result.error) throw new Error(result.error);
       await loadImages('rawimages', current?.id, pageOffset);
+      void loadMetrics();
       setMessage(`Gallery refreshed. ${result.added_or_changed.toLocaleString()} new or changed images.`);
     } catch (e) { setMessage((e as Error).message); } finally { setBusy(false); }
   };
@@ -294,31 +326,37 @@ export default function App() {
     if (!current) return;
     setBusy(true); setMessage('Saving annotations…');
     try {
-      await api(`/api/images/${current.id}/annotations`, {
+      const saved = await api<{ image: ImageRecord }>(`/api/images/${current.id}/annotations`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ annotations: boxes.map((b) => ({ bbox_xyxy_pixels: b.bbox_xyxy_pixels, verified_result: b.verified_result })) }),
       });
       setMessage('Annotations saved to PostgreSQL.');
       setDirtyImageId(null);
-      setImages((all) => all.map((item) => item.id === current.id ? { ...item, verified: false, verified_at: null } : item));
-      const detail = await api<ImageRecord>(`/api/images/${current.id}`);
-      setBoxes((detail.annotations || []).map((a) => ({ ...a, verified_result: a.verified_result || '' })));
+      setImages((all) => all.map((item) => item.id === current.id ? { ...item, verified: false, review_status: saved.image.review_status, verified_at: null } : item));
+      setBoxes((saved.image.annotations || []).map((a) => ({ ...a, verified_result: a.verified_result || '' })));
+      void loadMetrics();
+    } catch (e) { setMessage((e as Error).message); } finally { setBusy(false); }
+  };
+  const setReviewStatus = async (status: ReviewStatus) => {
+    if (!current || dirtyImageId === current.id) return;
+    setBusy(true);
+    try {
+      const result = await api<{ image: ImageRecord }>(`/api/images/${current.id}/review-status`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status }),
+      });
+      setImages((all) => all.map((item) => item.id === current.id ? { ...item, verified: result.image.verified, review_status: result.image.review_status, verified_at: result.image.verified_at } : item));
+      setMessage(`Image status set to ${status.replace('_', ' ')}.`);
+      await loadImages(source, current.id, pageOffset);
+      void loadMetrics();
     } catch (e) { setMessage((e as Error).message); } finally { setBusy(false); }
   };
   const markVerified = async () => {
-    if (!current || dirtyImageId === current.id) return;
-    const verified = !current.verified;
-    setBusy(true);
-    try {
-      const result = await api<{ image: ImageRecord }>(`/api/images/${current.id}/verification`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ verified }),
-      });
-      setImages((all) => all.map((item) => item.id === current.id ? { ...item, verified: result.image.verified, verified_at: result.image.verified_at } : item));
-      setMessage(verified ? 'Image marked verified.' : 'Verification removed.');
-    } catch (e) { setMessage((e as Error).message); } finally { setBusy(false); }
+    if (!current) return;
+    await setReviewStatus(current.review_status === 'verified' ? 'needs_review' : 'verified');
   };
   const removeBox = (idx: number) => {
     setBoxes((all) => all.filter((_, n) => n !== idx));
+    setSelectedBoxIndex((selected) => selected == null || selected === idx ? null : selected > idx ? selected - 1 : selected);
     if (current) setDirtyImageId(current.id);
   };
   const point = () => {
@@ -334,6 +372,7 @@ export default function App() {
     const box = [Math.min(drawing[0], drawing[2]), Math.min(drawing[1], drawing[3]), Math.max(drawing[0], drawing[2]), Math.max(drawing[1], drawing[3])];
     if (box[2] - box[0] >= 3 && box[3] - box[1] >= 3) {
       setBoxes((old) => [...old, { bbox_xyxy_pixels: box, verified_result: '', ai_detection: false }]);
+      setSelectedBoxIndex(boxes.length);
       if (current) setDirtyImageId(current.id);
     }
     setDrawing(null);
@@ -342,6 +381,59 @@ export default function App() {
     setBoxes((all) => all.map((box, i) => i === idx ? { ...box, verified_result: text } : box));
     if (current) setDirtyImageId(current.id);
   };
+  const moveBox = (idx: number, x: number, y: number) => {
+    if (!current) return;
+    setBoxes((all) => all.map((box, i) => {
+      if (i !== idx) return box;
+      const [x1, y1, x2, y2] = box.bbox_xyxy_pixels;
+      const width = x2 - x1, height = y2 - y1;
+      const left = Math.max(0, Math.min(current.width - width, x / scale));
+      const top = Math.max(0, Math.min(current.height - height, y / scale));
+      return { ...box, bbox_xyxy_pixels: [left, top, left + width, top + height] };
+    }));
+    setDirtyImageId(current.id);
+  };
+  const resizeBoxCorner = (idx: number, corner: number, x: number, y: number) => {
+    if (!current) return;
+    setBoxes((all) => all.map((box, i) => {
+      if (i !== idx) return box;
+      const coords = [...box.bbox_xyxy_pixels];
+      const moveLeft = corner === 0 || corner === 2;
+      const moveTop = corner === 0 || corner === 1;
+      const xIndex = moveLeft ? 0 : 2;
+      const yIndex = moveTop ? 1 : 3;
+      coords[xIndex] = Math.max(0, Math.min(current.width, x / scale));
+      coords[yIndex] = Math.max(0, Math.min(current.height, y / scale));
+      const left = Math.min(coords[0], coords[2]), right = Math.max(coords[0], coords[2]);
+      const top = Math.min(coords[1], coords[3]), bottom = Math.max(coords[1], coords[3]);
+      if (right - left < 2 || bottom - top < 2) return box;
+      return { ...box, bbox_xyxy_pixels: [left, top, right, bottom] };
+    }));
+    setDirtyImageId(current.id);
+  };
+
+  useEffect(() => {
+    const handleShortcut = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      const editing = !!target?.closest('input, textarea, select, [contenteditable="true"]');
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
+        event.preventDefault(); void save(); return;
+      }
+      if (editing || event.altKey || event.ctrlKey || event.metaKey) return;
+      if (event.key === 'ArrowRight' || event.key.toLowerCase() === 'n') { event.preventDefault(); move(1); }
+      else if (event.key === 'ArrowLeft' || event.key.toLowerCase() === 'p') { event.preventDefault(); move(-1); }
+      else if (event.key.toLowerCase() === 'v') { event.preventDefault(); void markVerified(); }
+      else if (event.key.toLowerCase() === 't') {
+        event.preventDefault();
+        const idx = selectedBoxIndex ?? (boxes.length ? 0 : null);
+        if (idx != null) { setSelectedBoxIndex(idx); ocrInputRefs.current[idx]?.focus(); }
+      } else if (event.key === 'Delete' || event.key === 'Backspace') {
+        if (selectedBoxIndex != null) { event.preventDefault(); removeBox(selectedBoxIndex); setSelectedBoxIndex(null); }
+      }
+    };
+    window.addEventListener('keydown', handleShortcut);
+    return () => window.removeEventListener('keydown', handleShortcut);
+  }, [current?.id, boxes.length, selectedBoxIndex, save, markVerified, move, removeBox]);
 
   return <main className="app-shell">
     <header className="topbar"><div><h1>PlateLens</h1><p>License plate detection and annotation</p></div>
@@ -376,15 +468,40 @@ export default function App() {
         <progress value={item.completed} max={item.total || 1} />
       </div>)}
     </section>}
+    {dashboardMetrics && <section className="metrics-dashboard" aria-label="Dataset and evaluation metrics">
+      <div className="metric"><span>Total images</span><strong>{dashboardMetrics.total_images.toLocaleString()}</strong></div>
+      <div className="metric"><span>Verified plates</span><strong>{dashboardMetrics.verified_plates.toLocaleString()}</strong></div>
+      <div className="metric"><span>Images needing review</span><strong>{dashboardMetrics.images_needing_review.toLocaleString()}</strong></div>
+      <div className="metric"><span>OCR exact-match accuracy</span><strong>{dashboardMetrics.ocr_exact_match_accuracy == null ? '—' : `${(dashboardMetrics.ocr_exact_match_accuracy * 100).toFixed(1)}%`}</strong><small>{dashboardMetrics.ocr_evaluated_plates.toLocaleString()} verified OCR labels</small></div>
+      <div className="metric"><span>Character error rate (CER)</span><strong>{dashboardMetrics.character_error_rate == null ? '—' : `${(dashboardMetrics.character_error_rate * 100).toFixed(1)}%`}</strong><small>Lower is better</small></div>
+      <div className="metric"><span>Detection recall</span><strong>{dashboardMetrics.detection_recall == null ? 'No evaluation labels' : `${(dashboardMetrics.detection_recall * 100).toFixed(1)}%`}</strong><small>AI-matched / {dashboardMetrics.detection_evaluated_plates.toLocaleString()} verified plates</small></div>
+      <button className="metrics-refresh" onClick={() => void loadMetrics()} title="Refresh dataset and evaluation metrics">Refresh metrics</button>
+    </section>}
     <section className="toolbar"><select value={source} onChange={(e) => changeSource(e.target.value as 'rawimages' | 'upload')}><option value="rawimages">Server rawimages</option><option value="upload">Uploads</option></select>
       {source === 'rawimages' && <button onClick={refresh} disabled={busy}>Refresh images</button>}
+      <label className="review-filter">Review queue
+        <select value={confidenceReview} onChange={(e) => { setFilteringImages(true); setConfidenceReview(e.target.value as typeof confidenceReview); }}>
+          <option value="all">All · low confidence first</option><option value="detector">Detector confidence</option><option value="ocr">OCR confidence</option><option value="both">Detector or OCR</option>
+        </select>
+      </label>
+      <label className="review-filter">Status filter
+        <select value={statusFilter} onChange={(e) => { setFilteringImages(true); setStatusFilter(e.target.value as typeof statusFilter); }}>
+          <option value="all">All statuses</option><option value="needs_review">Needs review</option><option value="verified">Verified</option><option value="rejected">Rejected</option><option value="no_plate">No plate</option>
+        </select>
+      </label>
+      {confidenceReview !== 'all' && <label className="review-filter">Below
+        <select value={confidenceThreshold} onChange={(e) => { setFilteringImages(true); setConfidenceThreshold(Number(e.target.value)); }}>
+          <option value={0.5}>50%</option><option value={0.6}>60%</option><option value={0.7}>70%</option><option value={0.8}>80%</option><option value={0.9}>90%</option>
+        </select>
+      </label>}
+      {filteringImages && <span className="filtering-indicator" role="status"><span className="filter-spinner" />Filtering images…</span>}
       <div className="image-review-controls" aria-label="Image review navigation">
         <button aria-label="Previous image" title="Previous image" onClick={() => move(-1)} disabled={!images.length || (!pageOffset && index === 0)}>←</button>
         <span className="counter">{images.length ? `${pageOffset + index + 1} / ${imageTotal}` : 'No images'}</span>
         <button aria-label="Next image" title="Next image" onClick={() => move(1)} disabled={!images.length || pageOffset + index >= imageTotal - 1}>→</button>
-        {current && <button className={`verify-action ${current.verified ? 'verified' : ''}`} onClick={markVerified} disabled={busy || dirtyImageId === current.id}>
-          {current.verified ? 'Undo verified' : 'Mark verified'}
-        </button>}
+        {current && <select className={`review-status-action status-${current.review_status}`} aria-label="Set current image review status" title="Set review status" value={current.review_status} onChange={(e) => void setReviewStatus(e.target.value as ReviewStatus)} disabled={busy || dirtyImageId === current.id}>
+          <option value="needs_review">Needs review</option><option value="verified">Verified</option><option value="rejected">Rejected</option><option value="no_plate">No plate</option>
+        </select>}
       </div>
       <form className="jump-form" onSubmit={jumpToOrder}>
         <label htmlFor="jump-order">Go to image</label>
@@ -406,9 +523,10 @@ export default function App() {
       <div className="canvas-wrap">
         {current && imageEl ? <Stage ref={stageRef} width={stageSize.width * zoom} height={stageSize.height * zoom} onMouseDown={startDraw} onMouseMove={updateDraw} onMouseUp={endDraw} onTouchStart={startDraw as never} onTouchMove={updateDraw} onTouchEnd={endDraw}>
           <Layer><KImage image={imageEl} width={current.width * scale} height={current.height * scale} listening={false} />
-            {boxes.map((box, i) => { const [x1,y1,x2,y2] = box.bbox_xyxy_pixels; return <Fragment key={i}>
-              <Rect x={x1*scale} y={y1*scale} width={(x2-x1)*scale} height={(y2-y1)*scale} stroke={box.ai_detection ? '#f59e0b' : '#16a34a'} strokeWidth={2} onContextMenu={(e) => { e.evt.preventDefault(); removeBox(i); }} />
+            {boxes.map((box, i) => { const [x1,y1,x2,y2] = box.bbox_xyxy_pixels; const handles = [[x1,y1],[x2,y1],[x1,y2],[x2,y2]]; return <Fragment key={i}>
+              <Rect x={x1*scale} y={y1*scale} width={(x2-x1)*scale} height={(y2-y1)*scale} stroke={box.ai_detection ? '#f59e0b' : '#16a34a'} strokeWidth={2} draggable onClick={() => setSelectedBoxIndex(i)} onTap={() => setSelectedBoxIndex(i)} onDragStart={() => setSelectedBoxIndex(i)} onDragEnd={(e) => moveBox(i, e.target.x(), e.target.y())} onContextMenu={(e) => { e.evt.preventDefault(); removeBox(i); }} />
               <Text x={x1*scale} y={Math.max(0,y1*scale-21)} text={box.ai_result || box.verified_result || `Plate ${i+1}`} fontSize={14} fill="white" padding={3} listening={false} />
+              {selectedBoxIndex === i && handles.map(([hx, hy], corner) => <Circle key={corner} x={hx*scale} y={hy*scale} radius={6} fill="#38bdf8" stroke="#e0f2fe" strokeWidth={1} draggable onMouseDown={(e) => e.cancelBubble = true} onTouchStart={(e) => e.cancelBubble = true} onDragEnd={(e) => resizeBoxCorner(i, corner, e.target.x(), e.target.y())} />)}
             </Fragment>; })}
             {drawing && <Rect x={Math.min(drawing[0],drawing[2])*scale} y={Math.min(drawing[1],drawing[3])*scale} width={Math.abs(drawing[2]-drawing[0])*scale} height={Math.abs(drawing[3]-drawing[1])*scale} stroke="#38bdf8" dash={[5,3]} />}
           </Layer>
@@ -418,13 +536,13 @@ export default function App() {
         <div className="annotation-list">{boxes.map((box, i) => <article className="annotation" key={i} onContextMenu={(e) => { e.preventDefault(); removeBox(i); }}>
           <div className="annotation-head"><strong>Plate {i + 1}</strong><span className={box.ai_detection ? 'ai-tag' : 'manual-tag'}>{box.ai_detection ? 'AI' : 'Manual'}</span></div>
           <PlateCrop image={imageEl} box={box.bbox_xyxy_pixels} />
-          <label>Verified plate text<input value={box.verified_result} onChange={(e) => setText(i, e.target.value.toUpperCase())} placeholder={box.ai_result || 'Enter text'} /></label>
+          <label>Verified plate text<input ref={(element) => { ocrInputRefs.current[i] = element; }} onFocus={() => setSelectedBoxIndex(i)} value={box.verified_result} onChange={(e) => setText(i, e.target.value.toUpperCase())} placeholder={box.ai_result || 'Enter text'} /></label>
           {box.ai_detection && <div className="stats"><span>AI guess <b>{box.ai_result || '—'}</b></span><span>OCR confidence <b>{percent(box.ocr_confidence)}</b></span><span>Detection confidence <b>{percent(box.detection_confidence)}</b></span><span>Country <b>{box.country || 'Unknown'} · {percent(box.country_confidence)}</b></span></div>}
         </article>)}</div>
         {job && (job.status === 'running' || job.status === 'queued') && <div className="job"><div>{job.kind === 'batch' ? 'Batch detection' : 'Image detection'} {job.completed}/{job.total}</div><progress value={job.completed} max={job.total || 1} /></div>}
       </aside>
     </section>
     {message && <div className="status" role="status">{message}</div>}
-    <footer>AI boxes are orange; manual boxes are green. Drag on the image to add a box.</footer>
+    <footer>AI boxes are orange; manual boxes are green. OCR guesses are never saved as ground truth automatically. Save label edits before changing review status. Shortcuts: ←/→ or P/N navigate · Ctrl/⌘+S save · V verify · Delete remove selected box · T focus plate text.</footer>
   </main>;
 }
