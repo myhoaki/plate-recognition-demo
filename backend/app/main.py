@@ -12,10 +12,11 @@ from . import models  # noqa: F401 - register ORM metadata
 from .celery_app import celery_app
 from .database import Base, SessionLocal, engine, get_db
 from .logic import annotation_payload, image_payload, import_legacy_records, iou, sync_raw_images
-from .models import Annotation, DetectionJob, ImageRecord, utcnow
-from .schemas import SaveAnnotations, SetVerification, StartDetection
+from .models import Annotation, DetectionJob, ImageRecord, TrainingJob, utcnow
+from .schemas import SaveAnnotations, SetVerification, StartDetection, StartTraining
 from .storage import RAW_IMAGES_DIR, UPLOADS_DIR, image_path, save_upload
 from .tasks import run_detection_job  # noqa: F401 - register Celery task
+from .training import run_training_job
 
 _refresh_lock = Lock()
 _batch_queue_lock = Lock()
@@ -250,6 +251,8 @@ def save_annotations(image_id: str, payload: SaveAnnotations, db: Session = Depe
 
 
 def queue_job(db: Session, kind: str, image_ids: list[str]) -> dict:
+    if db.scalar(select(TrainingJob.id).where(TrainingJob.status.in_(["queued", "running"])).limit(1)):
+        raise HTTPException(409, "Detector training is active. Wait for training to finish before running detection.")
     job = DetectionJob(id=uuid4().hex, kind=kind, image_ids=image_ids, total=len(image_ids), status="queued")
     db.add(job)
     db.commit()
@@ -354,3 +357,97 @@ def job_state(job_id: str, db: Session = Depends(get_db)):
         "started_at": job.started_at,
         "finished_at": job.finished_at,
     }
+
+
+def training_payload(job: TrainingJob) -> dict:
+    return {
+        "id": job.id,
+        "status": job.status,
+        "config": job.config,
+        "split_counts": job.split_counts,
+        "current_epoch": job.current_epoch,
+        "total_epochs": job.total_epochs,
+        "metrics": job.metrics,
+        "model_ready": bool(job.model_path and Path(job.model_path).is_file()),
+        "error": job.error,
+        "created_at": job.created_at,
+        "started_at": job.started_at,
+        "finished_at": job.finished_at,
+    }
+
+
+@app.post("/api/training-jobs")
+def start_training(payload: StartTraining, db: Session = Depends(get_db)):
+    existing = db.scalar(
+        select(TrainingJob)
+        .where(TrainingJob.status.in_(["queued", "running"]))
+        .order_by(TrainingJob.created_at.desc())
+    )
+    if existing:
+        return training_payload(existing)
+    detection_tasks = _worker_detection_tasks()
+    if detection_tasks:
+        raise HTTPException(409, "Wait for active image detection to finish before training the detector.")
+    if detection_tasks is None and db.scalar(
+        select(DetectionJob.id).where(DetectionJob.status.in_(["queued", "running"])).limit(1)
+    ):
+        raise HTTPException(409, "Wait for active image detection to finish before training the detector.")
+    config = payload.model_dump()
+    job = TrainingJob(
+        id=uuid4().hex,
+        status="queued",
+        config=config,
+        total_epochs=config["epochs"],
+    )
+    db.add(job)
+    db.commit()
+    run_training_job.delay(job.id)
+    return training_payload(job)
+
+
+@app.get("/api/training-jobs/active")
+def active_training_job(db: Session = Depends(get_db)):
+    job = db.scalar(
+        select(TrainingJob)
+        .where(TrainingJob.status.in_(["queued", "running"]))
+        .order_by(TrainingJob.created_at.desc())
+    )
+    return {"job": training_payload(job) if job else None}
+
+
+@app.get("/api/training-jobs/latest")
+def latest_training_job(db: Session = Depends(get_db)):
+    job = db.scalar(select(TrainingJob).order_by(TrainingJob.created_at.desc()).limit(1))
+    return {"job": training_payload(job) if job else None}
+
+
+@app.get("/api/training-jobs/{job_id}")
+def get_training_job(job_id: str, db: Session = Depends(get_db)):
+    job = db.get(TrainingJob, job_id)
+    if not job:
+        raise HTTPException(404, "Training job not found")
+    return training_payload(job)
+
+
+@app.post("/api/training-jobs/{job_id}/activate")
+def activate_training_model(job_id: str, db: Session = Depends(get_db)):
+    import os
+    import shutil
+
+    job = db.get(TrainingJob, job_id)
+    if not job or job.status != "completed" or not job.model_path:
+        raise HTTPException(400, "A completed training job is required.")
+    training_dir = Path(os.environ.get("TRAINING_DIR", "/training")).resolve()
+    model_path = Path(job.model_path).resolve()
+    try:
+        model_path.relative_to(training_dir / "jobs" / job.id)
+    except ValueError:
+        raise HTTPException(400, "Training model path is invalid.") from None
+    if not model_path.is_file():
+        raise HTTPException(404, "Trained model file not found.")
+    active_path = training_dir / "active.pt"
+    temporary_path = training_dir / "active.pt.tmp"
+    temporary_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(model_path, temporary_path)
+    os.replace(temporary_path, active_path)
+    return {"status": "active", "model": "trained detector", "job_id": job.id}

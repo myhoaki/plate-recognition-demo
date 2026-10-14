@@ -6,7 +6,7 @@ celery_app = Celery(
     "platelens",
     broker=os.environ.get("REDIS_URL", "redis://redis:6379/0"),
     backend=os.environ.get("REDIS_URL", "redis://redis:6379/0"),
-    include=["app.tasks"],
+    include=["app.tasks", "app.training"],
 )
 celery_app.conf.update(
     task_serializer="json",

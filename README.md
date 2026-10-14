@@ -1,6 +1,6 @@
 # PlateLens
 
-A self-hosted, still-image license-plate annotation workspace. AI detection and OCR run as background jobs; users can review or draw plate boxes, verify the OCR text, and save annotations to PostgreSQL. Saving annotations does not train the model.
+A self-hosted, still-image license-plate annotation workspace. AI detection, OCR, and optional detector training run as background jobs; users can review or draw plate boxes, verify the OCR text, and save annotations to PostgreSQL.
 
 ## Architecture
 
@@ -39,6 +39,7 @@ PUID="$(id -u)" PGID="$(id -g)" docker compose up -d --build
 - Put source images in `rawimages/`. The API reads them without modifying them.
 - Uploads are stored in `docker/storage/uploads/`.
 - Model cache files are stored in `docker/models/`.
+- Detector training datasets and checkpoints are stored in `docker/training/` and are not included in Git.
 - PostgreSQL data and Redis queue data are held in named Docker volumes.
 - Existing JSON annotations in `docker/labels/` are imported into PostgreSQL at API startup. They are kept as a backup and are not deleted.
 
@@ -67,6 +68,12 @@ Set `PUID` and `PGID` to the output of `id -u` and `id -g` on the server account
 6. Click **Mark verified** after reviewing the saved annotations. The image shows a verified badge; editing or rerunning detection clears that mark.
 
 Each annotation stores the box coordinates, AI OCR guess, user-verified text, detector confidence, OCR confidence, country/region estimate, and country/region confidence when available. Batch detection status is shown in the workspace.
+
+## Train a detector
+
+Mark reviewed images as **Verified**, then select **Train detector**. Training uses verified images and their saved boxes, with a deterministic 80/10/10 train/validation/test split. The small YOLO11n pretrained detector is fine-tuned; epoch and batch size are configurable, and validation metrics are recorded each epoch. After training, the held-out test split is evaluated. Use **Use this model** to make the trained detector active; OCR remains the existing FastALPR model. Training artifacts and the active checkpoint are kept in `docker/training/`.
+
+The training worker downloads the pretrained YOLO weights on its first run and needs internet access. This Compose setup installs CPU-only PyTorch; training can take a long time on large datasets. Detection jobs wait while training is active.
 
 ## Dataset importer
 

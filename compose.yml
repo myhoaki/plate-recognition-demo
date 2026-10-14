@@ -19,9 +19,11 @@ services:
       DATA_DIR: /data
       RAW_IMAGES_DIR: /rawimages
       LEGACY_LABELS_DIRS: /legacy-labels:/legacy-volume
+      TRAINING_DIR: /training
     volumes:
       - ./docker/models:/home/app/.cache
       - ./docker/storage:/data
+      - ./docker/training:/training
       - ./rawimages:/rawimages:ro
       - ./docker/labels:/legacy-labels:ro
       - label-data:/legacy-volume:ro
@@ -46,9 +48,11 @@ services:
       REDIS_URL: redis://redis:6379/0
       DATA_DIR: /data
       RAW_IMAGES_DIR: /rawimages
+      TRAINING_DIR: /training
     volumes:
       - ./docker/models:/home/app/.cache
       - ./docker/storage:/data
+      - ./docker/training:/training
       - ./rawimages:/rawimages:ro
     depends_on:
       db:

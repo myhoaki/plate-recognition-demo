@@ -9,6 +9,7 @@ type Annotation = {
 };
 type ImageRecord = { id: string; filename: string; width: number; height: number; detection_complete: boolean; verified: boolean; verified_at?: string | null; file_url: string; annotations?: Annotation[] };
 type Job = { job_id?: string; id?: string; kind?: 'single' | 'batch'; status: string; total: number; completed: number; detected: number; failed: number; error?: string | null; existing?: boolean };
+type TrainingJob = { id: string; status: string; config: { epochs: number; batch_size: number; image_size: number; device: string }; split_counts: Record<string, number>; current_epoch: number; total_epochs: number; metrics: Record<string, number>; model_ready: boolean; error?: string | null };
 type RefreshState = { running: boolean; processed: number; total: number; added_or_changed: number; error?: string | null };
 type Box = { bbox_xyxy_pixels: number[]; verified_result: string; ai_detection: boolean; ai_result?: string | null; detection_confidence?: number | null; ocr_confidence?: number | null; country?: string | null; country_confidence?: number | null };
 const PAGE_SIZE = 500;
@@ -23,6 +24,24 @@ const api = async <T,>(url: string, options?: RequestInit): Promise<T> => {
 };
 const percent = (v?: number | null) => v == null ? '—' : `${(v * 100).toFixed(1)}%`;
 
+function PlateCrop({ image, box }: { image: HTMLImageElement | null; box: number[] }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const [rawX1, rawY1, rawX2, rawY2] = box;
+    if (!canvas || !image || box.length < 4) return;
+    const x1 = Math.max(0, Math.floor(Math.min(rawX1, rawX2)));
+    const y1 = Math.max(0, Math.floor(Math.min(rawY1, rawY2)));
+    const x2 = Math.min(image.naturalWidth, Math.ceil(Math.max(rawX1, rawX2)));
+    const y2 = Math.min(image.naturalHeight, Math.ceil(Math.max(rawY1, rawY2)));
+    if (x2 <= x1 || y2 <= y1) return;
+    canvas.width = x2 - x1;
+    canvas.height = y2 - y1;
+    canvas.getContext('2d')?.drawImage(image, x1, y1, x2 - x1, y2 - y1, 0, 0, canvas.width, canvas.height);
+  }, [image, box]);
+  return <canvas className="plate-crop" ref={canvasRef} aria-label="Cropped plate image" />;
+}
+
 export default function App() {
   const [images, setImages] = useState<ImageRecord[]>([]);
   const [index, setIndex] = useState(0);
@@ -33,16 +52,46 @@ export default function App() {
   const [boxes, setBoxes] = useState<Box[]>([]);
   const [imageEl, setImageEl] = useState<HTMLImageElement | null>(null);
   const [stageSize, setStageSize] = useState({ width: 800, height: 520 });
+  const [zoom, setZoom] = useState(1);
   const [busy, setBusy] = useState(false);
   const [dirtyImageId, setDirtyImageId] = useState<string | null>(null);
   const [message, setMessage] = useState('');
   const [job, setJob] = useState<Job | null>(null);
   const [activeJobs, setActiveJobs] = useState<Job[]>([]);
+  const [trainingJob, setTrainingJob] = useState<TrainingJob | null>(null);
+  const [showTrainingForm, setShowTrainingForm] = useState(false);
+  const [trainingConfig, setTrainingConfig] = useState({ epochs: 30, batch_size: 8, image_size: 640, device: 'auto' });
   const [drawing, setDrawing] = useState<number[] | null>(null);
   const stageRef = useRef<Konva.Stage>(null);
   const current = images[index];
   const jobActive = job?.status === 'queued' || job?.status === 'running';
   const batchActive = activeJobs.some((item) => item.kind === 'batch');
+  const trainingActive = trainingJob?.status === 'queued' || trainingJob?.status === 'running';
+
+  useEffect(() => {
+    let cancelled = false;
+    api<{ job: TrainingJob | null }>('/api/training-jobs/latest').then((result) => {
+      if (!cancelled && result.job) setTrainingJob(result.job);
+    }).catch(() => undefined);
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    if (!trainingJob?.id || !trainingActive) return;
+    let cancelled = false;
+    let timer = 0;
+    const poll = async () => {
+      try {
+        const state = await api<TrainingJob>(`/api/training-jobs/${trainingJob.id}`);
+        if (cancelled) return;
+        setTrainingJob(state);
+        if (state.status === 'queued' || state.status === 'running') timer = window.setTimeout(poll, 2000);
+        else setMessage(state.status === 'completed' ? 'Training completed. Review the test metrics, then activate the model if you want to use it.' : `Training ${state.status}: ${state.error || 'see training details.'}`);
+      } catch { if (!cancelled) timer = window.setTimeout(poll, 4000); }
+    };
+    timer = window.setTimeout(poll, 1000);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [trainingJob?.id, trainingActive]);
 
   useEffect(() => {
     let cancelled = false;
@@ -149,7 +198,7 @@ export default function App() {
     fit(); window.addEventListener('resize', fit); return () => window.removeEventListener('resize', fit);
   }, [current?.width, current?.height]);
 
-  const scale = useMemo(() => current ? stageSize.width / current.width : 1, [current, stageSize.width]);
+  const scale = useMemo(() => current ? stageSize.width / current.width * zoom : zoom, [current, stageSize.width, zoom]);
   const move = (n: number) => {
     if (n < 0 && index === 0 && pageOffset > 0) {
       const offset = Math.max(0, pageOffset - PAGE_SIZE);
@@ -220,6 +269,27 @@ export default function App() {
         : `${batch ? 'Batch' : 'Image'} detection queued for ${result.total.toLocaleString()} image${result.total === 1 ? '' : 's'}. It will continue on the server if you close this page.`);
     } catch (e) { setMessage((e as Error).message); } finally { setBusy(false); }
   };
+  const startTraining = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setBusy(true); setMessage('Queueing detector training…');
+    try {
+      const job = await api<TrainingJob>('/api/training-jobs', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(trainingConfig),
+      });
+      setTrainingJob(job);
+      setShowTrainingForm(false);
+      setMessage(job.status === 'running' ? 'Detector training is already running.' : 'Detector training queued. It continues on the server if you close this page.');
+    } catch (e) { setMessage((e as Error).message); } finally { setBusy(false); }
+  };
+  const activateModel = async () => {
+    if (!trainingJob) return;
+    setBusy(true);
+    try {
+      await api(`/api/training-jobs/${trainingJob.id}/activate`, { method: 'POST' });
+      setMessage('Trained detector activated. New detections will use it with the existing OCR model.');
+    } catch (e) { setMessage((e as Error).message); } finally { setBusy(false); }
+  };
   const save = async () => {
     if (!current) return;
     setBusy(true); setMessage('Saving annotations…');
@@ -276,8 +346,28 @@ export default function App() {
   return <main className="app-shell">
     <header className="topbar"><div><h1>PlateLens</h1><p>License plate detection and annotation</p></div>
       <div className="top-actions"><label className="upload button">Upload image<input type="file" accept="image/*" onChange={(e) => upload(e.target.files?.[0])} /></label>
-        <button onClick={() => detect(true)} disabled={busy || batchActive}>Detect all raw images</button></div>
+        <button onClick={() => setShowTrainingForm((value) => !value)} disabled={busy || trainingActive}>Train detector</button>
+        <button onClick={() => detect(true)} disabled={busy || batchActive || trainingActive}>Detect all raw images</button></div>
     </header>
+    {showTrainingForm && <section className="training-panel">
+      <form onSubmit={startTraining}>
+        <label>Epochs<input type="number" min="1" max="300" value={trainingConfig.epochs} onChange={(e) => setTrainingConfig({ ...trainingConfig, epochs: Number(e.target.value) })} /></label>
+        <label>Batch size<input type="number" min="1" max="64" value={trainingConfig.batch_size} onChange={(e) => setTrainingConfig({ ...trainingConfig, batch_size: Number(e.target.value) })} /></label>
+        <label>Image size<input type="number" min="320" max="1280" step="32" value={trainingConfig.image_size} onChange={(e) => setTrainingConfig({ ...trainingConfig, image_size: Number(e.target.value) })} /></label>
+        <span className="split-note">Verified images split: 80% train · 10% validation · 10% test</span>
+        <button className="primary" type="submit" disabled={busy || trainingActive}>Start training</button>
+      </form>
+      <p>Only images marked Verified are included. At least 3 verified images are required.</p>
+    </section>}
+    {trainingJob && <section className="training-status" aria-live="polite">
+      <div className="training-status-head"><strong>Detector training · {trainingJob.status}</strong>
+        {trainingJob.model_ready && <button onClick={activateModel} disabled={busy}>Use this model</button>}
+      </div>
+      {trainingActive && <><span>Epoch {trainingJob.current_epoch} / {trainingJob.total_epochs} · batch {trainingJob.config.batch_size}</span><progress value={trainingJob.current_epoch} max={trainingJob.total_epochs || 1} /></>}
+      {Object.keys(trainingJob.split_counts).length > 0 && <span>Train {trainingJob.split_counts.train} · Validation {trainingJob.split_counts.val} · Test {trainingJob.split_counts.test}</span>}
+      {trainingJob.metrics['metrics/mAP50(B)'] != null && <span>{trainingActive ? 'Validation' : 'Test'} mAP50: {(trainingJob.metrics['metrics/mAP50(B)'] * 100).toFixed(1)}% · mAP50–95: {((trainingJob.metrics['metrics/mAP50-95(B)'] || 0) * 100).toFixed(1)}%</span>}
+      {trainingJob.error && <span className="training-error">{trainingJob.error}</span>}
+    </section>}
     {activeJobs.length > 0 && <section className="queue-status" aria-live="polite">
       <strong>Detection queue</strong>
       {activeJobs.map((item) => <div className="queue-item" key={item.id}>
@@ -288,25 +378,33 @@ export default function App() {
     </section>}
     <section className="toolbar"><select value={source} onChange={(e) => changeSource(e.target.value as 'rawimages' | 'upload')}><option value="rawimages">Server rawimages</option><option value="upload">Uploads</option></select>
       {source === 'rawimages' && <button onClick={refresh} disabled={busy}>Refresh images</button>}
-      <button aria-label="Previous image" onClick={() => move(-1)} disabled={!images.length || (!pageOffset && index === 0)}>←</button>
-      <span className="counter">{images.length ? `${pageOffset + index + 1} / ${imageTotal}` : 'No images'}</span>
-      <button aria-label="Next image" onClick={() => move(1)} disabled={!images.length || pageOffset + index >= imageTotal - 1}>→</button>
+      <div className="image-review-controls" aria-label="Image review navigation">
+        <button aria-label="Previous image" title="Previous image" onClick={() => move(-1)} disabled={!images.length || (!pageOffset && index === 0)}>←</button>
+        <span className="counter">{images.length ? `${pageOffset + index + 1} / ${imageTotal}` : 'No images'}</span>
+        <button aria-label="Next image" title="Next image" onClick={() => move(1)} disabled={!images.length || pageOffset + index >= imageTotal - 1}>→</button>
+        {current && <button className={`verify-action ${current.verified ? 'verified' : ''}`} onClick={markVerified} disabled={busy || dirtyImageId === current.id}>
+          {current.verified ? 'Undo verified' : 'Mark verified'}
+        </button>}
+      </div>
       <form className="jump-form" onSubmit={jumpToOrder}>
         <label htmlFor="jump-order">Go to image</label>
         <input id="jump-order" type="number" min="1" max={imageTotal || 1} value={jumpOrder} onChange={(e) => setJumpOrder(e.target.value)} disabled={!imageTotal || busy} />
         <button type="submit" disabled={!imageTotal || busy}>Go</button>
       </form>
       <span className="filename">{current?.filename || 'Add images to rawimages/ or upload one'}</span>
-      {current && <span className={`verify-badge ${dirtyImageId === current.id ? 'pending' : current.verified ? 'verified' : 'unverified'}`}>
-        {dirtyImageId === current.id ? 'Unsaved edits' : current.verified ? '✓ Verified' : 'Not verified'}
-      </span>}
-      <button className="primary" onClick={() => detect(false)} disabled={busy || jobActive || !current}>Auto detect</button>
+      <div className="zoom-controls" aria-label="Image zoom controls">
+        <button aria-label="Zoom out" title="Zoom out" onClick={() => setZoom((value) => Math.max(0.25, Math.round((value - 0.25) * 100) / 100))} disabled={zoom <= 0.25}>−</button>
+        <span>{Math.round(zoom * 100)}%</span>
+        <button aria-label="Zoom in" title="Zoom in" onClick={() => setZoom((value) => Math.min(4, Math.round((value + 0.25) * 100) / 100))} disabled={zoom >= 4}>+</button>
+        <button onClick={() => setZoom(1)} disabled={zoom === 1}>Fit</button>
+      </div>
+      {current && dirtyImageId === current.id && <span className="verify-badge pending">Unsaved edits</span>}
+      <button className="primary" onClick={() => detect(false)} disabled={busy || jobActive || trainingActive || !current}>Auto detect</button>
       <button className="primary" onClick={save} disabled={busy || !current}>Save labels</button>
-      <button onClick={markVerified} disabled={busy || !current || dirtyImageId === current.id}>{current?.verified ? 'Undo verified' : 'Mark verified'}</button>
     </section>
     <section className="workspace">
       <div className="canvas-wrap">
-        {current && imageEl ? <Stage ref={stageRef} width={stageSize.width} height={stageSize.height} onMouseDown={startDraw} onMouseMove={updateDraw} onMouseUp={endDraw} onTouchStart={startDraw as never} onTouchMove={updateDraw} onTouchEnd={endDraw}>
+        {current && imageEl ? <Stage ref={stageRef} width={stageSize.width * zoom} height={stageSize.height * zoom} onMouseDown={startDraw} onMouseMove={updateDraw} onMouseUp={endDraw} onTouchStart={startDraw as never} onTouchMove={updateDraw} onTouchEnd={endDraw}>
           <Layer><KImage image={imageEl} width={current.width * scale} height={current.height * scale} listening={false} />
             {boxes.map((box, i) => { const [x1,y1,x2,y2] = box.bbox_xyxy_pixels; return <Fragment key={i}>
               <Rect x={x1*scale} y={y1*scale} width={(x2-x1)*scale} height={(y2-y1)*scale} stroke={box.ai_detection ? '#f59e0b' : '#16a34a'} strokeWidth={2} onContextMenu={(e) => { e.evt.preventDefault(); removeBox(i); }} />
@@ -319,6 +417,7 @@ export default function App() {
       <aside className="side-panel"><h2>Plate annotations <span>{boxes.length}</span></h2><p className="hint">Draw a box on the image. Right-click a box row to remove it.</p>
         <div className="annotation-list">{boxes.map((box, i) => <article className="annotation" key={i} onContextMenu={(e) => { e.preventDefault(); removeBox(i); }}>
           <div className="annotation-head"><strong>Plate {i + 1}</strong><span className={box.ai_detection ? 'ai-tag' : 'manual-tag'}>{box.ai_detection ? 'AI' : 'Manual'}</span></div>
+          <PlateCrop image={imageEl} box={box.bbox_xyxy_pixels} />
           <label>Verified plate text<input value={box.verified_result} onChange={(e) => setText(i, e.target.value.toUpperCase())} placeholder={box.ai_result || 'Enter text'} /></label>
           {box.ai_detection && <div className="stats"><span>AI guess <b>{box.ai_result || '—'}</b></span><span>OCR confidence <b>{percent(box.ocr_confidence)}</b></span><span>Detection confidence <b>{percent(box.detection_confidence)}</b></span><span>Country <b>{box.country || 'Unknown'} · {percent(box.country_confidence)}</b></span></div>}
         </article>)}</div>

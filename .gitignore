@@ -11,6 +11,8 @@
 !/docker/labels/.gitkeep
 /docker/results/*
 !/docker/results/.gitkeep
+/docker/training/*
+!/docker/training/.gitkeep
 
 # Local configuration and credentials
 .env

@@ -64,3 +64,20 @@ class DetectionJob(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class TrainingJob(Base):
+    __tablename__ = "training_jobs"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="queued", index=True)
+    config: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    split_counts: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    current_epoch: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    total_epochs: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    metrics: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    model_path: Mapped[str | None] = mapped_column(String(1000))
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
