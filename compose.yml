@@ -1,0 +1,89 @@
+services:
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-8000}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+
+  api:
+    build: ./backend
+    restart: unless-stopped
+    user: "${PUID:-1002}:${PGID:-1002}"
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://platelens:${POSTGRES_PASSWORD:-platelens-local}@db:5432/platelens
+      REDIS_URL: redis://redis:6379/0
+      DATA_DIR: /data
+      RAW_IMAGES_DIR: /rawimages
+      LEGACY_LABELS_DIRS: /legacy-labels:/legacy-volume
+    volumes:
+      - ./docker/models:/home/app/.cache
+      - ./docker/storage:/data
+      - ./rawimages:/rawimages:ro
+      - ./docker/labels:/legacy-labels:ro
+      - label-data:/legacy-volume:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+
+  worker:
+    build: ./backend
+    restart: unless-stopped
+    user: "${PUID:-1002}:${PGID:-1002}"
+    command: ["celery", "-A", "app.celery_app.celery_app", "worker", "--loglevel=INFO", "--concurrency=1"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://platelens:${POSTGRES_PASSWORD:-platelens-local}@db:5432/platelens
+      REDIS_URL: redis://redis:6379/0
+      DATA_DIR: /data
+      RAW_IMAGES_DIR: /rawimages
+    volumes:
+      - ./docker/models:/home/app/.cache
+      - ./docker/storage:/data
+      - ./rawimages:/rawimages:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: platelens
+      POSTGRES_USER: platelens
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-platelens-local}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U platelens -d platelens"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  postgres-data:
+  redis-data:
+  label-data:

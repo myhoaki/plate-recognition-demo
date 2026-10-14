@@ -1,0 +1,6 @@
+labels/*
+!labels/.gitkeep
+models/*
+!models/.gitkeep
+results/*
+!results/.gitkeep

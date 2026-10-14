@@ -1,0 +1,28 @@
+# Imported datasets and raw image collection
+/rawimages/
+/car-plate-detection-dataset/
+/dataset/
+/datasets/
+
+# Runtime data and generated model/label files
+/docker/storage/
+/docker/models/
+/docker/labels/*
+!/docker/labels/.gitkeep
+/docker/results/*
+!/docker/results/.gitkeep
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python and frontend build artifacts
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+frontend/node_modules/
+frontend/dist/

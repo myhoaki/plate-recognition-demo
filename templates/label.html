@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f4f6f3">
+  <title>Label plates — PlateLens</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/label" aria-label="PlateLens labeling"><span class="brand-mark">P</span> PlateLens</a>
+    <nav class="top-links"><a class="active" href="/label">Label data</a></nav>
+    <span class="top-note"><span class="status-dot"></span> Ground-truth annotation</span>
+  </header>
+  <main class="page-shell label-shell">
+    <section class="intro label-intro">
+      <div class="eyebrow"><span></span> ANNOTATION WORKSPACE</div>
+      <h1>Plate <span>labeling</span></h1>
+      <p class="intro-copy">Run AI detection to suggest plate boxes and text, then correct them and save verified ground truth.</p>
+      <div class="label-hint"><span>i</span><span><b>Verify every suggestion.</b> Each saved plate annotation includes its coordinates, AI OCR guess, and the OCR text you confirm.</span></div>
+    </section>
+
+    <section class="label-workspace">
+      <div class="label-main-card">
+        <div class="section-heading label-heading"><div><span class="section-kicker">01 / IMAGE</span><h2>Choose an image to label</h2></div><span class="file-limit">MAX 15 MB</span></div>
+        <div class="source-switch" role="group" aria-label="Choose image source">
+          <label class="source-option"><input type="radio" name="label-source" value="upload" checked><span class="source-icon">↑</span><span><b>Upload image</b><small>From your device</small></span></label>
+          <label class="source-option"><input type="radio" name="label-source" value="rawimages"><span class="source-icon folder-icon">▱</span><span><b>Server folder</b><small>From rawimages/ · {{ raw_images|length }} files</small></span></label>
+        </div>
+        <div id="label-upload-panel">
+          <label class="label-pick" for="label-image"><span class="upload-icon"><svg viewBox="0 0 24 24"><path d="M12 16V4m0 0L7 9m5-5 5 5M5 15v4a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-4"/></svg></span><span><b id="pick-title">Select a still image</b><small id="pick-subtitle">JPG, PNG, WebP, or BMP</small></span><span class="browse-button">Browse</span><input id="label-image" type="file" accept="image/jpeg,image/png,image/webp,image/bmp"></label>
+        </div>
+        <div class="raw-panel" id="label-raw-panel" hidden>
+          {% if raw_images %}<select id="label-rawimage" name="rawimage" class="gallery-select" disabled>{% for image_name in raw_images %}<option value="{{ image_name }}">{{ image_name }}</option>{% endfor %}</select><div class="raw-folder-row"><p class="raw-folder-hint">Choose an image below, or run detection across all <b>{{ raw_images|length }}</b> images in <code>rawimages/</code>.</p><button id="batch-detect" class="batch-button" type="button">Detect all images</button></div><p id="batch-status" class="batch-status" role="status" aria-live="polite" hidden></p>{% else %}<div class="raw-empty"><span>▱</span><b>No images found in rawimages/</b><p>Add JPG, PNG, WebP, or BMP files, then refresh this page.</p></div>{% endif %}
+        </div>
+        <div class="canvas-wrap" id="canvas-wrap" hidden><div class="canvas-toolbar" id="canvas-toolbar"><span><i class="status-dot"></i> IMAGE / DRAW</span><span>Drag to add · right-click to remove</span><div class="raw-image-nav" id="raw-image-nav" data-raw-gallery data-images="{{ raw_images|tojson|forceescape }}" data-select="label-rawimage" hidden><button class="gallery-arrow gallery-prev" type="button" aria-label="Previous image">‹</button><span class="gallery-filename"></span><span class="gallery-position"></span><button class="gallery-arrow gallery-next" type="button" aria-label="Next image">›</button></div><button id="detect-plates" type="button" disabled>Auto-detect</button><button id="clear-boxes" type="button">Clear boxes</button></div><canvas id="label-canvas"></canvas></div>
+
+        <div class="objects-section" id="objects-section" hidden>
+          <div class="objects-title"><div><span class="section-kicker">02 / GROUND TRUTH</span><h2>Plate labels <span id="box-count" class="mini-count">0</span></h2></div><span class="small-note">Leave text blank to accept the AI guess</span></div>
+          <div id="object-list" class="object-list"></div>
+        </div>
+
+        <div class="label-alert" id="label-alert" role="status" hidden></div>
+        <div class="save-row"><p class="privacy-note"><span aria-hidden="true">⌑</span> Each saved annotation combines plate coordinates and verified OCR text.</p><button id="save-labels" class="analyze-button" type="button" disabled><span>Save labels as JSON</span><span aria-hidden="true">↗</span></button></div>
+        <div class="saved-message" id="saved-message" hidden></div>
+      </div>
+
+      <aside class="label-side">
+        <div class="info-card label-guide"><div class="info-top"><span class="sparkle">✳</span><span class="section-kicker">HOW TO LABEL</span></div><ol><li><span>1</span><p><b>Load an image</b><small>Choose one clear image containing a vehicle plate.</small></p></li><li><span>2</span><p><b>Run Auto-detect</b><small>Review AI boxes; right-click wrong boxes and draw replacements.</small></p></li><li><span>3</span><p><b>Verify the plate text</b><small>Leave the field blank to accept a matching AI guess, or type the correct characters.</small></p></li><li><span>4</span><p><b>Save the annotation</b><small>Coordinates, AI guess, and verified text are written together.</small></p></li></ol><div class="fine-print">Coordinates are stored in pixels and normalized form. Verified text is stored in <code>ocr.verified_result</code> and <code>ground_truth</code>.</div></div>
+        <div class="info-card label-recent"><div class="section-kicker">RECENT LABELS</div><h3>Saved annotations</h3>
+          {% if labels %}<div class="recent-list">{% for item in labels %}<a class="recent-item" href="/labels/{{ item.id }}.json"><span class="recent-icon">{ }</span><span class="recent-meta"><b>{{ item.filename }}</b><small>{{ item.source }} · {{ item.count }} plate{% if item.count != 1 %}s{% endif %} · {{ item.created_at[:10] }}</small></span><span class="recent-download">↓</span></a>{% endfor %}</div>{% else %}<p class="empty-recent">Your saved JSON files will appear here.</p>{% endif %}
+        </div>
+      </aside>
+    </section>
+    <footer><span>PlateLens <span class="footer-dot">·</span> Label demo</span><span>Verify every label before using it as ground truth.</span></footer>
+  </main>
+  <script src="{{ url_for('static', filename='raw-gallery.js') }}" defer></script>
+  <script src="{{ url_for('static', filename='label.js', v='20261013-country-confidence') }}" defer></script>
+</body>
+</html>
