@@ -19,7 +19,6 @@ from typing import Literal
 import cv2
 import numpy as np
 from ultralytics import YOLO
-from paddleocr import PaddleOCR
 
 
 class BoundingBox:
@@ -104,14 +103,16 @@ def configure_ultralytics_paths(training_dir: Path | None = None) -> Path:
 @lru_cache(maxsize=2)
 def _get_paddle_ocr(
     rec_model_dir: str | None, model_mtime_ns: int
-) -> PaddleOCR:
+) -> PaddleOCR | None:
     """PaddleOCR recognition-only instance.
 
-    use_det=False  - skip text detection (we already have YOLO26 boxes)
-    use_cls=False  - skip orientation classification
-    lang="en"      - Latin-script recognition, covers Vietnamese plates
-    rec_model_dir  - optional path to a fine-tuned PaddleOCR recognition model
+    Returns None if paddleocr is not available (import deferred to avoid
+    crashing the API on startup if paddlex/paddleocr has issues).
     """
+    try:
+        from paddleocr import PaddleOCR  # noqa: PLC0415 - lazy import
+    except ImportError:
+        return None
     return PaddleOCR(
         use_det=False,
         use_cls=False,

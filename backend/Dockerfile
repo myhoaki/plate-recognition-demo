@@ -13,7 +13,7 @@ COPY requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 COPY tests ./tests
-RUN mkdir -p /home/app/.cache /data/uploads \
+RUN mkdir -p /home/app/.cache /home/app/.paddlex /home/app/.paddleocr /data/uploads \
     && chown -R app:app /home/app /app /data
 RUN chmod 755 /home/app
 USER app
