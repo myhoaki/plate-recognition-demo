@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PlateLens — License Plate Recognition Project Review</title>
+<style>
+  :root {
+    --ink: #111827; --muted: #6b7280; --bg: #ffffff;
+    --line: #e5e7eb; --accent: #2563eb; --accent-bg: #eff6ff;
+    --code-bg: #f3f4f6; --border: #d1d5db;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.6; color: var(--ink); background: var(--bg);
+    margin: 0; padding: 0;
+  }
+  .container {
+    max-width: 900px; margin: 0 auto; padding: 40px 24px;
+  }
+  h1 {
+    font-size: 26px; margin: 0 0 8px; border-bottom: 3px solid var(--accent);
+    padding-bottom: 8px; color: var(--ink);
+  }
+  h2 {
+    font-size: 20px; margin: 30px 0 12px; color: var(--ink); border-bottom: 1px solid var(--line); padding-bottom: 6px;
+  }
+  h3 {
+    font-size: 16px; margin: 20px 0 8px; color: #374151;
+  }
+  p { margin: 0 0 10px; }
+  ul { margin: 6px 0 12px; padding-left: 22px; }
+  li { margin: 0 0 4px; }
+  code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 0.88em; background: var(--code-bg); padding: 2px 6px;
+    border-radius: 4px; color: #b00020;
+  }
+  pre {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 0.85em; background: var(--code-bg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 12px; overflow-x: auto; margin: 10px 0;
+  }
+  table {
+    width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 0.9em;
+  }
+  th, td { border: 1px solid var(--border); padding: 8px 10px; text-align: left; vertical-align: top; }
+  th { background: #f9fafb; font-weight: 700; color: #374151; }
+  .meta {
+    color: var(--muted); font-size: 0.9em; margin-bottom: 18px;
+  }
+  .tag {
+    display: inline-block; font-size: 0.8em; font-weight: 700; padding: 1px 6px;
+    border-radius: 3px; margin-right: 6px; white-space: nowrap;
+  }
+  .tag-confirmed { background: #dcfce7; color: #166534; }
+  .tag-inferred { background: #fef3c7; color: #92400e; }
+  .tag-recommended { background: #dbeafe; color: #1e40af; }
+  .hr { border: 0; border-top: 1px solid var(--line); margin: 24px 0; }
+  footer {
+    margin-top: 40px; padding-top: 20px; border-top: 1px solid var(--line);
+    color: var(--muted); font-size: 0.85em;
+  }
+  .file-line { color: #4b5563; font-family: ui-monospace, monospace; font-size: 0.82em; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>PlateLens — License Plate Recognition Project Review</h1>
+  <p class="meta">A self-hosted license-plate dataset review, model training, and recognition workspace.<br>
+  Repository: <code>https://github.com/myhoaki/plate-recognition-demo</code><br>
+  Prepared for a beginner learning AI-based license plate recognition. Grounded in the actual source code — nothing is hypothetical unless explicitly labeled.</p>
+
+  <h2>1. Executive Summary</h2>
+  <p>PlateLens is a four-section web workspace for license-plate recognition:</p>
+  <ul>
+    <li><strong>Verify Datasets</strong> — review registered images, draw and adjust license-plate boxes, correct OCR text, set a review state, and save.</li>
+    <li><strong>Train Detection</strong> — train a YOLO detector to localize license plates using verified, frozen dataset snapshots.</li>
+    <li><strong>Train OCR</strong> — train a small CRNN to read characters from plate crops using verified OCR snapshots.</li>
+    <li><strong>Recognition / Test</strong> — upload one vehicle image, run detector + OCR together, view boxes, crops, confidence values, and elapsed time; also run batch evaluation against a frozen test split.</li>
+  </ul>
+  <p>Two applications exist in the repository, but only one is served by Docker Compose:</p>
+  <ul>
+    <li><code>app.py</code> (root) — a legacy Flask app. NOT served by Docker Compose. Stores labels as JSON files in <code>docker/labels/</code>.</li>
+    <li><code>backend/app/main.py</code> — the FastAPI app that Docker Compose runs (<code>uvicorn app.main:app</code>). Stores metadata in PostgreSQL, images on disk, and runs long jobs via Celery + Redis.</li>
+  </ul>
+  <p>This review focuses on the FastAPI backend, because that is what <code>docker compose up</code> starts.</p>
+
+  <hr class="hr">
+
+  <h2>2. Architecture</h2>
+  <p>Components and how they communicate:</p>
+  <ul>
+    <li><strong>Browser</strong> (React/Vite frontend) — App.tsx, RecognitionTest.tsx, OCRDatasetReview.tsx. Calls the backend via HTTP fetch (JSON). Polls every 1–2 seconds for job status; no WebSockets.</li>
+    <li><strong>Backend API</strong> (FastAPI, uvicorn) — backend/app/main.py exposes all REST endpoints. Delegates inference to alpr.py, training to training.py / ocr_training.py, evaluation to evaluation.py, and dataset management to datasets.py / dataset_registry.py.</li>
+    <li><strong>PostgreSQL database</strong> — holds ImageRecord, Annotation, TrainingJob, EvaluationJob, DatasetSnapshot, DatasetSplitAssignment, DatasetManifest, DatasetProvenance, DetectionJob.</li>
+    <li><strong>File storage</strong> (bind-mounted host folders) — datasets/raw/ (registered images), datasets/snapshots/ (frozen read-only snapshots), datasets/manifests/ (versioned JSON), docker/storage/uploads/ (user uploads), docker/training/ (jobs, checkpoints, best.pt, active.pt), docker/models/ (FastALPR model cache).</li>
+    <li><strong>YOLO detector</strong> — TrainedYoloDetector (ultralytics) or FastALPR default <code>yolo-v9-t-384-license-plate-end2end</code>. Outputs bounding boxes in pixel coordinates plus detection confidence.</li>
+    <li><strong>OCR recognizer</strong> — FastALPR default <code>cct-xs-v2-global-model</code>, or custom CRNN (PlateOCRNetwork) trained via CTC loss. Reads plate crops and returns text + confidence.</li>
+    <li><strong>Background worker</strong> (Celery + Redis) — one worker with concurrency=1. Runs detection jobs, training jobs, and evaluation jobs asynchronously. Redis is both broker and result backend.</li>
+  </ul>
+  <p><strong>Data flow:</strong> Browser HTTP → FastAPI → PostgreSQL (metadata) + disk (files). FastAPI enqueues long jobs to Celery → Redis → worker. Worker reads/writes PostgreSQL and disk. Models load weights from docker/models/ or docker/training/ and cache them in memory via lru_cache.</p>
+
+  <hr class="hr">
+
+  <h2>3. End-to-End Workflow: One Image</h2>
+  <p>Tracing a hypothetical image <code>car001.jpg</code> (1920×1080) through the Recognition / Test path. Every file/function reference is real code.</p>
+
+  <h3>Step 1 — Image upload</h3>
+  <p><strong>Frontend:</strong> RecognitionTest.tsx:51–57. User picks a file, clicks Run recognition. Browser POSTs to POST /api/images/upload.</p>
+  <p><strong>Backend</strong> (main.py:558–586): <code>save_upload()</code> (storage.py:48) streams the file in 1 MB chunks to <code>docker/storage/uploads/&lt;uuid&gt;&lt;ext&gt;</code>, computes SHA-256, enforces the 15 MB limit, and decodes dimensions with OpenCV. An ImageRecord row is inserted into PostgreSQL (<code>id</code>, <code>source=upload</code>, <code>sha256</code>, <code>storage_key</code>, <code>width</code>, <code>height</code>). Duplicate SHA-256 returns the existing record.</p>
+  <p><strong>Failure:</strong> wrong file type → 400; &gt;15 MB → 413; unreadable image → 400.</p>
+
+  <h3>Step 2 — Run recognition (detector + OCR together)</h3>
+  <p><strong>Frontend:</strong> RecognitionTest.tsx:53. POST /api/recognition with <code>{image_id, detector_job_id, ocr_job_id}</code>.</p>
+  <p><strong>Backend</strong> (main.py:87–136): loads the ImageRecord, resolves the file path via <code>image_path()</code> (storage.py:68), resolves checkpoints (validates completed TrainingJob and model file under <code>docker/training/jobs/&lt;id&gt;/</code>, otherwise uses active checkpoint <code>docker/training/active.pt</code> / <code>active_ocr.pt</code>, otherwise FastALPR defaults in alpr.py:87–97), then calls <code>run_detection(path, detector, ocr)</code> (alpr.py:108).</p>
+  <p>Each plate crop is base64-encoded into <code>crop_data_url</code> (main.py:124–133) so the frontend can show crops without another request. Returns detections plus <code>elapsed_ms</code>.</p>
+
+  <h3>Step 3 — YOLO detection</h3>
+  <p><strong>Backend</strong> (alpr.py:108–126, alpr.py:32–61): <code>run_detection()</code> calls <code>get_alpr(...).predict(image)</code>. <code>get_alpr()</code> builds <code>fast_alpr.ALPR</code> with either default models (<code>detector_model=yolo-v9-t-384-license-plate-end2end</code>, <code>ocr_model=cct-xs-v2-global-model</code>, <code>ocr_device=cpu</code>) or trained models (<code>TrainedYoloDetector</code> + <code>TrainedPlateOCR</code>). <code>TrainedYoloDetector.predict()</code> (alpr.py:39–61) runs <code>model.predict(frame)</code> and returns <code>DetectionResult</code> objects with <code>label=license_plate</code>, <code>confidence</code>, and <code>BoundingBox(x1,y1,x2,y2)</code> in pixels.</p>
+  <p><strong>Bounding-box meaning:</strong> (<code>x1</code>, <code>y1</code>) = top-left corner, (<code>x2</code>, <code>y2</code>) = bottom-right corner, in pixel coordinates of the original image. Example: <code>[420, 540, 560, 620]</code> = a plate from x=420 to x=560, y=540 to y=620 (140×80 pixels).</p>
+  <p><strong>Detection confidence</strong> = YOLO's objectness/class confidence that this box contains a license plate (0–1). Higher = more likely a plate is present. It does NOT mean the text is correct.</p>
+
+  <h3>Step 4 — Plate crop</h3>
+  <p><strong>Backend</strong> (main.py:124–133): OpenCV crops <code>frame[y1:y2, x1:x2]</code> (NumPy slice) for each detection, re-encodes as JPEG, base64-encodes into <code>crop_data_url</code>. No separate cropping model — pure image slice using the detector's pixel box.</p>
+
+  <h3>Step 5 — OCR recognition</h3>
+  <p><strong>Backend</strong> (alpr.py:108–126): FastALPR runs OCR inside each detected box. Default FastALPR OCR returns text + confidence from library internals. Trained OCR checkpoint uses <code>TrainedPlateOCR.predict()</code> (ocr_model.py:64–79): <code>prepare_plate_crop()</code> (ocr_model.py:39–45) converts to grayscale, resizes to 160×48, normalizes to 0..1, shape (1,1,48,160); forward pass through <code>PlateOCRNetwork</code> (ocr_model.py:17–33) — CNN → 2-layer bidirectional LSTM → linear over 37 classes (36 alphanumeric + CTC blank); <code>decode_greedy()</code> (ocr_model.py:48–61) — greedy CTC decoding, remove repeats/blanks, average per-character probabilities as confidence.</p>
+  <p><strong>Alphabet:</strong> <code>0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ</code>. Unsupported text is preserved but cannot be used by the CRNN trainer until the alphabet is extended.</p>
+
+  <h3>Step 6 — Final prediction</h3>
+  <p><strong>Backend</strong> (main.py:134–136) returns JSON with <code>image_id</code>, <code>filename</code>, <code>width</code>, <code>height</code>, <code>file_url</code>, detections (each with <code>bbox_xyxy_pixels</code>, <code>text</code>, <code>ocr_confidence</code>, <code>detection_confidence</code>, <code>country</code>, <code>country_confidence</code>, <code>crop_data_url</code>), <code>elapsed_ms</code>, <code>detector_job_id</code>, <code>ocr_job_id</code>.</p>
+
+  <h3>Step 7 — Database / storage</h3>
+  <p>Image file and metadata are stored in Step 1. Recognition results are NOT saved to PostgreSQL in this path — returned to the browser only. (Detection jobs via /api/detection-jobs do save annotations to the DB.) No automatic ground-truth comparison happens during inference.</p>
+
+  <h3>Step 8 — Evaluation against ground truth (separate, not automatic)</h3>
+  <p>Only if the user explicitly clicks Evaluate test split (RecognitionTest.tsx:61–69 → POST /api/evaluations, main.py:458 → <code>run_evaluation_job</code>, evaluation.py:64). Loads a frozen detector snapshot test split, runs <code>run_detection()</code> on each test image, matches predictions to ground truth using greedy one-to-one IoU ≥ 0.50 (evaluation.py:129–131). Text is trimmed and case-insensitive. Computes detection precision/recall, mAP50/mAP50–95, OCR exact accuracy, CER, and end-to-end accuracy (all plates match AND zero false detections AND zero missed plates). Stores results in <code>EvaluationJob.results</code>.</p>
+
+  <h3>Failure scenarios</h3>
+  <ul>
+    <li>No plate detected: detections is empty. UI shows No plates detected.</li>
+    <li>Multiple plates: each detection returned independently with its own box and text.</li>
+    <li>OCR fails / empty: text is <code>""</code>, ocr_confidence is None. UI shows No text recognized.</li>
+    <li>Image unreadable: run_detection raises ValueError → API returns 422 Recognition failed.</li>
+    <li>Background job fails: Celery task sets status=failed and stores error (truncated to 2000 chars) in PostgreSQL (tasks.py:120–127, training.py:411–412, evaluation.py:176–177).</li>
+    <li>Checkpoint missing: selected_checkpoint() (main.py:96–109) returns 400 if job not completed or file missing.</li>
+  </ul>
+
+  <hr class="hr">
+
+  <h2>4. YOLO and OCR in This Implementation</h2>
+
+  <h3>Object detection vs OCR</h3>
+  <p>Object detection (YOLO) answers where is the plate? Outputs bounding boxes in pixel coordinates plus detection confidence. Class is always license_plate (class 0). OCR answers what does the plate say? Receives a cropped plate image, outputs text string plus confidence.</p>
+
+  <h3>Default models (confirmed in code)</h3>
+  <ul>
+    <li><strong>Detector:</strong> <code>yolo-v9-t-384-license-plate-end2end</code> — FastALPR-packaged YOLOv9 (app.py:39, alpr.py:80). Downloaded automatically on first use into docker/models/.</li>
+    <li><strong>OCR:</strong> <code>cct-xs-v2-global-model</code> — FastALPR OCR (app.py:41, alpr.py:82). Runs on CPU (<code>ocr_device=cpu</code>).</li>
+  </ul>
+
+  <h3>Trained models (confirmed in code)</h3>
+  <ul>
+    <li><strong>Detector training</strong> (training.py) uses ultralytics YOLO (training.py:231) starting from <code>yolo11n.pt</code> (training.py:249) or retained <code>best_detector.pt</code> (training.py:248). Trains to localize license_plate boxes. Output: <code>best.pt</code> → docker/training/jobs/&lt;id&gt;/best.pt and docker/training/best_detector.pt.</li>
+    <li><strong>OCR training</strong> (ocr_training.py) trains custom CRNN PlateOCRNetwork (ocr_model.py:17–33) with CTC loss (nn.CTCLoss, ocr_training.py:490). Output: <code>best.pt</code> with state_dict + alphabet.</li>
+  </ul>
+
+  <h3>Does YOLO training change the OCR model?</h3>
+  <p>No. Confirmed in code. Detector training only touches YOLO weights (<code>best_detector.pt</code>, <code>active.pt</code>). OCR training only touches CRNN weights (<code>best_ocr.pt</code>, <code>active_ocr.pt</code>). <code>run_training_job</code> dispatches to <code>run_ocr_training</code> only when <code>config.model_type == "ocr"</code> (training.py:212–216).</p>
+
+  <h3>CPU vs GPU (confirmed in code)</h3>
+  <ul>
+    <li>Default FastALPR inference uses <code>ocr_device=cpu</code> (app.py:41, alpr.py:83).</li>
+    <li>YOLO training: <code>device=None if auto, else config device</code> (training.py:348) — Ultralytics picks CUDA if available.</li>
+    <li>OCR training: <code>torch.device("cuda" if torch.cuda.is_available() else "cpu")</code> (ocr_training.py:475).</li>
+    <li>Docker Compose does not request GPUs, so without Docker GPU support training runs on CPU and will be slow.</li>
+  </ul>
+
+  <hr class="hr">
+
+  <h2>5. Annotation and Ground-Truth Workflow</h2>
+
+  <h3>How annotations are stored (confirmed in code)</h3>
+  <p>PostgreSQL table annotations (models.py:33–50): <code>bbox_xyxy_pixels</code> (JSONB pixel box [x1,y1,x2,y2]), <code>bbox_normalized_xywh</code> (JSONB normalized [center_x, center_y, width, height] in 0..1), <code>ai_detection</code> (boolean), <code>ai_result</code> (AI OCR guess), <code>verified_result</code> (human-verified plate text / ground truth), <code>detection_confidence</code>, <code>ocr_confidence</code>, <code>country</code>, <code>country_confidence</code>.</p>
+
+  <h3>How ground truth is created (confirmed in code)</h3>
+  <ul>
+    <li><strong>AI pre-labels:</strong> <code>detect_plates_for_labeling()</code> (app.py:333–385, legacy Flask) or batch detection (tasks.py:14–127, FastAPI) runs detector, stores AI boxes with <code>ai_detection=True</code>, <code>ai_result</code>=OCR guess, <code>verified_result=NULL</code>.</li>
+    <li><strong>Human corrects:</strong> in Verify Datasets UI (App.tsx:434–455, setText), user edits <code>verified_result</code> (typed uppercase) and can move/resize boxes. <code>save()</code> (App.tsx:397–411) POSTs to POST /api/images/{id}/annotations (main.py:655–713).</li>
+    <li><strong>Save logic:</strong> <code>save_annotations()</code> (main.py:655) matches each manual box to an AI box by IoU ≥ 0.5; if matched inherits <code>ai_detection=True</code>, <code>ai_result</code>, confidences; otherwise <code>ai_detection=False</code>. Replaces all annotations for the image and sets <code>review_status=needs_review</code>, <code>verified_at=NULL</code>.</li>
+    <li><strong>Verification:</strong> <code>set_image_review_status()</code> (main.py:632–640) sets <code>review_status</code> and <code>verified_at</code> (only when status=verified). Verified + verified_at not null is what makes an image eligible for training.</li>
+  </ul>
+  <p><strong>Key rule:</strong> OCR guesses are never saved as ground truth automatically. The human must type <code>verified_result</code> and set status to verified (README.md:17, app.py:496–500).</p>
+
+  <hr class="hr">
+
+  <h2>6. Dataset Splitting and Training Workflow</h2>
+
+  <h3>1. Which annotations qualify for training?</h3>
+  <p>Detector: source=registered, review_status=verified, verified_at IS NOT NULL, at least one annotation (datasets.py:176–177, dataset_registry.py:176). OCR: annotations with non-empty verified_result, plus imported OCR CSV rows with verification_status=verified (ocr_training.py:246–282, dataset_registry.py:178–181).</p>
+
+  <h3>2. Conversion to YOLO format</h3>
+  <p>Each annotation's <code>bbox_normalized_xywh</code> = [center_x, center_y, width, height] in 0..1. Written as <code>0 &lt;cx&gt; &lt;cy&gt; &lt;w&gt; &lt;h&gt;</code> (class 0 = license_plate) to <code>labels/&lt;split&gt;/&lt;sample_id&gt;.txt</code> (datasets.py:73–78, training.py:113–123). One class only: <code>names: 0: license_plate</code> in data.yaml (datasets.py:85).</p>
+
+  <h3>3. Images and labels matched</h3>
+  <p>By sample_id (= image id = UUID). Snapshot manifest lists each sample with image path, label path, split, SHA-256. Training links/copies the image and writes the matching .txt label file.</p>
+
+  <h3>4. Train/validation/test splitting</h3>
+  <p>Detector snapshots: <code>create_manifest()</code> (dataset_registry.py:138–249) assigns splits. Existing DatasetSplitAssignment rows preserved; new verified samples default to train; groups share a split. Deterministic 80/10/10 via <code>initial_split()</code> (dataset_registry.py:90–93, SHA-256 of group_id). Training from scratch: <code>_split_sizes()</code> (training.py:26–37) splits verified images 80/10/10 with <code>random.Random(42).shuffle()</code>. Reassigning a test sample requires <code>--confirm-test-change</code> (dataset_registry.py:263–266).</p>
+
+  <h3>5. Training configuration</h3>
+  <p>schemas.py:44–59: model_type (detector/ocr), dataset_snapshot_id, epochs (1–300), batch_size (1–64), image_size (320–1280), device (auto/cpu/0/1…), train_ratio/validation_ratio/test_ratio (must sum to 1).</p>
+
+  <h3>6. Pretrained model and architecture</h3>
+  <p>Detector: Ultralytics YOLO, weights <code>yolo11n.pt</code> (training.py:249) or retained <code>best_detector.pt</code> (training.py:248). OCR: PlateOCRNetwork (CNN + BiLSTM + linear, ocr_model.py:17–33), alphabet 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ (37 classes incl. blank), input 160×48 grayscale.</p>
+
+  <h3>7. What happens in a single epoch (detector)</h3>
+  <p>training.py:201–410: <code>_prepare_dataset()</code> builds/validates YOLO dataset dir and data.yaml. YOLO(...).train() with callbacks: on_train_batch_end (record_batch) updates current_batch/total_batches in DB every ~1% of batches; on_fit_epoch_end (record_epoch) reads YOLO metrics (mAP50, mAP50–95, precision, recall, losses), computes score = 0.1*mAP50 + 0.9*mAP50–95, calls <code>_record_epoch_metrics()</code> which saves epoch history and marks <code>is_best</code> if score is highest. If best, copies runs/detector/weights/best.pt to jobs/&lt;id&gt;/best.pt. Validation callbacks track val progress. After all epochs, runs model.val(split=test) on test split, collects test_metrics. Copies best.pt to jobs/&lt;id&gt;/best.pt and global best_detector.pt, marks job completed, sets model_path.</p>
+
+  <h3>8. Where metrics and checkpoints are saved</h3>
+  <p>Metrics: PostgreSQL TrainingJob.metrics (JSONB) — epoch_history (last 300 epochs), best_epoch, best_score, best_metrics, final test metrics. Exposed via GET /api/training-jobs/{id}. Checkpoints: docker/training/jobs/&lt;id&gt;/best.pt and global docker/training/best_detector.pt / best_ocr.pt.</p>
+
+  <h3>9. Best checkpoint selection</h3>
+  <p>Detector: <code>is_best = score &gt;= best_score</code> where score = 0.1*mAP50 + 0.9*mAP50–95 (training.py:301–304). OCR: best = highest val_plate_accuracy (ocr_training.py:530). Epoch marked is_best in epoch_history corresponds to best.pt.</p>
+
+  <h3>10. How trained model becomes available for inference</h3>
+  <p>POST /api/training-jobs/{id}/activate (main.py:957–980) copies jobs/&lt;id&gt;/best.pt → docker/training/active.pt (detector) or active_ocr.pt (OCR). <code>get_alpr()</code> (alpr.py:87–97) prefers active.pt/active_ocr.pt if present, else falls back to FastALPR defaults. POST /api/recognition can also select a specific completed checkpoint by detector_job_id/ocr_job_id.</p>
+
+  <hr class="hr">
+
+  <h2>7. Model Evaluation and Deployment Workflow</h2>
+
+  <h3>Evaluation (confirmed in code)</h3>
+  <ul>
+    <li><strong>Training-time validation/test</strong> (YOLO built-in): during detector training, Ultralytics validates on val split each epoch and tests on test split at the end (training.py:373–382). Metrics: mAP50, mAP50–95, precision, recall.</li>
+    <li><strong>End-to-end batch evaluation</strong> (explicit, user-triggered): POST /api/evaluations → run_evaluation_job (evaluation.py:64). Runs detector+OCR on every image in frozen snapshot test split. Greedy one-to-one IoU ≥ 0.50 matching (evaluation.py:129–131). Text trimmed, case-insensitive (README.md:20). Metrics: detection precision/recall, mAP50/mAP50–95 (via Ultralytics), OCR exact accuracy, CER, end-to-end accuracy (all plates match AND zero false detections AND zero missed plates). Results stored in EvaluationJob.results; incorrect examples (up to 500) saved for inspection.</li>
+  </ul>
+
+  <h3>Deployment (confirmed in code)</h3>
+  <p>No separate model registry or deployment pipeline. Deployment = activating a checkpoint: training completes → best.pt saved → user clicks Activate → active_training_model() copies to active.pt/active_ocr.pt → subsequent inference (get_alpr()) uses active checkpoint if present. A specific checkpoint can also be selected per-recognition request.</p>
+
+  <hr class="hr">
+
+  <h2>8. Current UI Problems and a Proposed Simpler UI</h2>
+
+  <h3>What the UI currently does (confirmed in code)</h3>
+  <p>App.tsx is a single-page app with 4 sections switched by tabs: production (Verify Datasets), detector training, OCR training, recognition. RecognitionTest and OCRDatasetReview are child components. The production view mixes image review, snapshot creation, import, batch detection, metrics, and the Konva canvas editor in one long view. Training configs (epochs, batch size, image size, ratios) sit alongside split progress and metrics. Snapshot management (create/import/delete) is embedded in the production view, detached from training. No visual connection between verified annotation → snapshot → training run → activated model → inference result.</p>
+
+  <h3>Why it may feel cluttered</h3>
+  <ul>
+    <li>One component (App.tsx, 690 lines) handles navigation, image polling, drawing, snapshots, training, metrics, keyboard shortcuts.</li>
+    <li>Snapshot create/import/delete controls are in Verify Datasets, but snapshots are consumed in Train Detection / Train OCR.</li>
+    <li>Confidence thresholds, review filters, and pagination are interwoven with the canvas editor.</li>
+    <li>Training metric names are raw Ultralytics keys (metrics/mAP50(B)) exposed directly to the user.</li>
+  </ul>
+
+  <h3>Proposed simpler structure (recommended — not implemented)</h3>
+  <ul>
+    <li><strong>Explore</strong> — primary action: run recognition on one image. Shows original image, detection boxes, plate crops, recognized text, confidences, elapsed time. Checkpoint selection defaults to active model.</li>
+    <li><strong>Label & Verify</strong> — primary action: correct boxes + plate text, set verified status. Shows image grid, canvas editor, per-plate AI guess vs verified text. Advanced: split ratios, manifest versioning, provenance hidden.</li>
+    <li><strong>Train & Evaluate</strong> — primary action: train detector/OCR, compare checkpoints. Shows snapshot list, training progress (epoch, batch, val), metrics (mAP, accuracy, CER), evaluation results, activate model. Advanced: raw SQL, dataset imports, legacy paths hidden.</li>
+  </ul>
+  <p>Each screen has one clear primary button; advanced options behind an Advanced toggle. This is a recommendation only — the current code does not implement this split.</p>
+
+  <hr class="hr">
+
+  <h2>9. Important Source Files and Functions to Study</h2>
+  <table>
+    <tr><th>File</th><th>Key functions</th><th>What to learn</th></tr>
+    <tr><td><code>backend/app/main.py</code></td><td>recognize_image (87), start_training (862), start_evaluation (458), save_annotations (655), create_dataset_snapshot (212)</td><td>All HTTP endpoints and request lifecycle</td></tr>
+    <tr><td><code>backend/app/alpr.py</code></td><td>run_detection (108), get_alpr (87), TrainedYoloDetector (32)</td><td>How YOLO + OCR inference runs</td></tr>
+    <tr><td><code>backend/app/training.py</code></td><td>run_training_job (201), record_epoch (282), _record_epoch_metrics (153)</td><td>YOLO training loop, callbacks, checkpoint selection</td></tr>
+    <tr><td><code>backend/app/ocr_training.py</code></td><td>run_ocr_training (456), _collect_crops (80), _evaluate (428)</td><td>CRNN training, CTC loss, crop collection, splitting</td></tr>
+    <tr><td><code>backend/app/ocr_model.py</code></td><td>PlateOCRNetwork (17), prepare_plate_crop (39), decode_greedy (48)</td><td>OCR model architecture and inference</td></tr>
+    <tr><td><code>backend/app/evaluation.py</code></td><td>run_evaluation_job (64)</td><td>End-to-end evaluation, IoU matching, metrics</td></tr>
+    <tr><td><code>backend/app/datasets.py</code></td><td>create_detection_snapshot (43), tree_sha256 (22)</td><td>Immutable snapshot creation</td></tr>
+    <tr><td><code>backend/app/dataset_registry.py</code></td><td>create_manifest (138), import_dataset (374), choose_split (96)</td><td>Dataset registration, manifests, splitting, imports</td></tr>
+    <tr><td><code>backend/app/models.py</code></td><td>ImageRecord, Annotation, TrainingJob, EvaluationJob, DatasetSnapshot</td><td>Database schema</td></tr>
+    <tr><td><code>backend/app/storage.py</code></td><td>save_upload (48), image_path (68), sha256_file (28)</td><td>File storage and content addressing</td></tr>
+    <tr><td><code>frontend/src/App.tsx</code></td><td>App (51), save (397), createSnapshot (345)</td><td>Frontend state, API calls, canvas editor</td></tr>
+    <tr><td><code>compose.yml</code></td><td>—</td><td>Service wiring (frontend, api, worker, db, redis)</td></tr>
+  </table>
+
+  <hr class="hr">
+
+  <h2>10. Beginner Learning Roadmap with Practical Exercises</h2>
+
+  <h3>Phase 1 — Understand the running system (no code changes)</h3>
+  <ul>
+    <li>Run the stack: <code>PUID=$(id -u) PGID=$(id -g) docker compose up -d --build</code>. Open http://localhost:8000.</li>
+    <li>Walk the UI: Verify Datasets → sync datasets folder → draw a box → type plate text → Save → Verify. Observe AI boxes are orange; manual boxes are green.</li>
+    <li>Trace one API call: browser DevTools → Network tab. Watch payload of POST /api/recognition and its response (crop_data_url, detection_confidence, ocr_confidence).</li>
+  </ul>
+
+  <h3>Phase 2 — Read code while running</h3>
+  <ul>
+    <li>Set a concrete box → trace to DB: after saving an annotation, inspect PostgreSQL: images row → annotations row with bbox_xyxy_pixels and verified_result.</li>
+    <li>Read alpr.py:108–126 (run_detection): map each output field to its source (box.x1..y2, ocr.text, result.detection.confidence).</li>
+    <li>Read training.py:282–304 (record_epoch): understand where mAP50 comes from and how is_best is decided.</li>
+  </ul>
+
+  <h3>Phase 3 — Experiments (read-only, no destructive commands)</h3>
+  <ul>
+    <li>Compare confidences: run recognition on several images. Note cases where detection_confidence is high but ocr_confidence is low (or vice versa). This teaches detection confidence ≠ text correctness.</li>
+    <li>Read an evaluation result: queue Evaluate test split against a detector snapshot. Watch detection_precision, detection_recall, ocr_exact_accuracy, end_to_end_accuracy.</li>
+    <li>Read the snapshot manifest: open datasets/snapshots/detero/&lt;id&gt;/manifest.json (if any exist). Verify it contains split_counts, data.yaml reference, per-sample SHA-256.</li>
+  </ul>
+
+  <h3>Phase 4 — Safe changes (after you understand)</h3>
+  <ul>
+    <li>Rename a UI label (e.g., Verify Datasets → Label & Verify) in App.tsx:583.</li>
+    <li>Add a new metric display in the training status section using an existing key from trained.metrics.</li>
+    <li>Do NOT retrain models, modify database schema, or delete snapshots until you've traced a full training run end to end.</li>
+  </ul>
+
+  <h3>Concepts to master, in order</h3>
+  <ul>
+    <li>Bounding box (xyxy pixels vs normalized xywh) — logic.py:7, models.py:39–40.</li>
+    <li>IoU (overlap between two boxes) — logic.py:7, evaluation.py:125–126.</li>
+    <li>Confidence score (what it does and doesn't mean) — alpr.py:108–126.</li>
+    <li>Ground truth vs AI guess — models.py:42–43, main.py:696–698.</li>
+    <li>Train/val/test split and data leakage — dataset_registry.py:90–104, training.py:87–124.</li>
+    <li>Epoch / batch / loss / backprop — ocr_training.py:498–517 (CRNN, easier to read than YOLO internals).</li>
+    <li>mAP, precision, recall — training.py:301, evaluation.py:166–167.</li>
+    <li>Checkpoint and activation — main.py:957–980, training.py:394–396.</li>
+    <li>CPU vs GPU — ocr_training.py:474–479, training.py:348.</li>
+  </ul>
+
+  <hr class="hr">
+
+  <h2>Verification Against Your Understanding</h2>
+  <p>Your 6-step mental model is mostly correct, with these code-level corrections:</p>
+  <table>
+    <tr><th>Your step</th><th>Reality in this code</th></tr>
+    <tr><td>1. Detect plate with YOLO</td><td>Confirmed. TrainedYoloDetector or FastALPR default YOLOv9.</td></tr>
+    <tr><td>2. Crop the plate</td><td>Confirmed. NumPy slice frame[y1:y2, x1:x2] (main.py:131).</td></tr>
+    <tr><td>3. OCR reads the crop</td><td>Confirmed. FastALPR default OCR or custom CRNN (TrainedPlateOCR).</td></tr>
+    <tr><td>4. Compare to ground truth</td><td>Partially. Only in explicit batch evaluation (evaluation.py), not during single-image inference.</td></tr>
+    <tr><td>5. Verified annotations → training data</td><td>Confirmed. Via snapshots (datasets.py, dataset_registry.py) and split assignments.</td></tr>
+    <tr><td>6. Train and evaluate before use</td><td>Confirmed. Training jobs → best.pt → activate → active.pt used by inference.</td></tr>
+  </table>
+  <p><strong>One gap:</strong> you might expect a separate crop model between detection and OCR. There isn't one — cropping is a pure image slice using the detector's pixel box. The only learned components are the detector (YOLO) and the recognizer (FastALPR OCR or custom CRNN).</p>
+
+  <footer>
+    <p>Labels used in this document:</p>
+    <ul>
+      <li><span class="tag tag-confirmed">Confirmed in code</span> directly supported by inspected source code (file:line references given).</li>
+      <li><span class="tag tag-inferred">Inferred</span> reasonable conclusion still needing verification.</li>
+      <li><span class="tag tag-recommended">Recommended</span> proposed improvement, not existing behavior.</li>
+    </ul>
+  </footer>
+</div>
+</body>
+</html>
