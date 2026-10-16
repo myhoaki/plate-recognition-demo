@@ -151,19 +151,6 @@ def _snapshot_payload(snapshot: DatasetSnapshot) -> dict:
             "manifest_sha256": snapshot.manifest_sha256, "created_at": snapshot.created_at}
 
 
-def _remove_readonly_tree(path: Path) -> None:
-    """Remove a directory tree whose files/dirs were made read-only (0o444/0o555)."""
-
-    def on_error(func, p, _exc_info):
-        try:
-            os.chmod(p, 0o777)
-        except OSError:
-            pass
-        func(p)
-
-    shutil.rmtree(path, onerror=on_error)
-
-
 @app.get("/api/dataset-snapshots")
 def list_dataset_snapshots(task: str | None = None, db: Session = Depends(get_db)):
     if task is not None and task not in {"detector", "ocr"}:
@@ -824,6 +811,17 @@ def start_training(payload: StartTraining, db: Session = Depends(get_db)):
     snapshot = db.get(DatasetSnapshot, payload.dataset_snapshot_id)
     if not snapshot or snapshot.task != payload.model_type:
         raise HTTPException(400, f"Select an existing {payload.model_type} dataset snapshot before training.")
+    # Reject early if the snapshot files are not fully written, so the job does
+    # not start and then fail inside the worker.
+    if payload.model_type == "detector":
+        snapshot_dir = Path(snapshot.path)
+        missing = [name for name in ("data.yaml", "manifest.json") if not (snapshot_dir / name).is_file()]
+        if missing:
+            raise HTTPException(
+                409,
+                f"Snapshot is not ready (missing {', '.join(missing)}). It may still be building "
+                "or was deleted. Rebuild the snapshot and try again.",
+            )
     existing = db.scalar(
         select(TrainingJob)
         .where(TrainingJob.status.in_(["queued", "running"]))

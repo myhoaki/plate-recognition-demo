@@ -50,7 +50,10 @@ def _prepare_dataset(job_id: str, config: dict, training_dir: Path) -> tuple[Pat
                 raise ValueError("Detector dataset snapshot path is outside the configured dataset directory.") from None
             yaml_path = dataset_dir / "data.yaml"
             if not yaml_path.is_file():
-                raise ValueError("Selected detector dataset snapshot is missing data.yaml.")
+                raise ValueError(
+                    f"Selected detector dataset snapshot is missing data.yaml ({dataset_dir}). "
+                    "The snapshot may still be building or was deleted. Rebuild it and try again."
+                )
             manifest_path = dataset_dir / "manifest.json"
             if not manifest_path.is_file():
                 raise ValueError("Selected detector dataset snapshot is missing its manifest.")

@@ -14,16 +14,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from sqlalchemy import select
-
-from .database import SessionLocal
-from .models import DatasetSnapshot, ImageRecord, utcnow
 from .storage import DATASETS_DIR, sha256_file
 
 # How many consecutive frames of one capture sequence form a single group.
@@ -51,6 +48,41 @@ def tree_sha256(root: Path) -> str:
             for chunk in iter(lambda: file.read(1024 * 1024), b""):
                 digest.update(chunk)
     return digest.hexdigest()
+
+
+def make_readonly(root: Path) -> None:
+    """Make a finished snapshot immutable on disk (files 0o444, dirs 0o555)."""
+    for item in root.rglob("*"):
+        if item.is_file():
+            item.chmod(0o444)
+    for item in sorted(
+        (item for item in root.rglob("*") if item.is_dir()),
+        key=lambda item: len(item.parts),
+        reverse=True,
+    ):
+        item.chmod(0o555)
+    root.chmod(0o555)
+
+
+def remove_readonly_tree(path: Path) -> None:
+    """Remove a snapshot tree whose files/dirs were made read-only (0o444/0o555).
+
+    Unlinking a file requires write permission on its *parent directory*, not on
+    the file itself, so every directory is made writable first (deepest first)
+    before the tree is removed. Removing a missing path is a no-op.
+    """
+    if not path.exists():
+        return
+    for item in sorted(path.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+        try:
+            item.chmod(0o755 if item.is_dir() else 0o644)
+        except OSError:
+            pass
+    try:
+        path.chmod(0o755)
+    except OSError:
+        pass
+    shutil.rmtree(path)
 
 
 def group_key(relative: Path) -> str:
@@ -296,6 +328,11 @@ def create_detection_snapshot() -> DatasetSnapshot:
         }
         (destination / "manifest.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
+        # Imported here so this module stays usable (and unit-testable) without
+        # a configured database.
+        from .database import SessionLocal
+        from .models import DatasetSnapshot, utcnow
+
         record = DatasetSnapshot(
             id=snapshot_id,
             task="detector",
@@ -309,16 +346,7 @@ def create_detection_snapshot() -> DatasetSnapshot:
             db.commit()
             db.refresh(record)
 
-        for item in destination.rglob("*"):
-            if item.is_file():
-                item.chmod(0o444)
-        for item in sorted(
-            (item for item in destination.rglob("*") if item.is_dir()),
-            key=lambda item: len(item.parts),
-            reverse=True,
-        ):
-            item.chmod(0o555)
-        destination.chmod(0o555)
+        make_readonly(destination)
         return record
     except Exception:
         shutil.rmtree(destination, ignore_errors=True)
