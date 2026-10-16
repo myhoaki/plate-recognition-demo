@@ -24,7 +24,7 @@ from .schemas import ImportSnapshot, RecognitionRequest, SaveAnnotations, SetRev
 from .storage import DATASETS_DIR, UPLOADS_DIR, image_path, save_upload
 from .tasks import run_detection_job  # noqa: F401 - register Celery task
 from .training import run_training_job
-from .datasets import create_detection_snapshot, tree_sha256
+from .datasets import create_detection_snapshot, tree_sha256, verify_snapshot
 from .alpr import run_detection
 from .evaluation import run_evaluation_job  # noqa: F401 - register Celery task
 
@@ -159,6 +159,14 @@ def list_dataset_snapshots(task: str | None = None, db: Session = Depends(get_db
     if task:
         query = query.where(DatasetSnapshot.task == task)
     return {"snapshots": [_snapshot_payload(row) for row in db.scalars(query).all()]}
+
+
+@app.post("/api/dataset-snapshots/{snapshot_id}/verify")
+def verify_dataset_snapshot(snapshot_id: str):
+    try:
+        return verify_snapshot(snapshot_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
 
 
 @app.post("/api/dataset-snapshots")

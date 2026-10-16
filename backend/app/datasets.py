@@ -64,6 +64,37 @@ def make_readonly(root: Path) -> None:
     root.chmod(0o555)
 
 
+def verify_snapshot(snapshot_id: str) -> dict:
+    """Recompute a snapshot's integrity hash and store the result.
+
+    Use this after an intentional, legitimate repair of snapshot files (for
+    example fixing an absolute path in data.yaml) so the recorded hash matches
+    the tree again. Reports the previous hash and the current one.
+    """
+    from .database import SessionLocal
+    from .models import DatasetSnapshot
+
+    with SessionLocal() as db:
+        snapshot = db.get(DatasetSnapshot, snapshot_id)
+        if not snapshot:
+            raise ValueError(f"Snapshot {snapshot_id} is not registered.")
+        directory = Path(snapshot.path)
+        if not directory.is_dir():
+            raise ValueError(f"Snapshot directory is missing: {directory}")
+        previous = snapshot.manifest_sha256
+        current = tree_sha256(directory)
+        snapshot.manifest_sha256 = current
+        db.commit()
+        return {
+            "id": snapshot.id,
+            "task": snapshot.task,
+            "path": snapshot.path,
+            "previous_sha256": previous,
+            "manifest_sha256": current,
+            "changed": previous != current,
+        }
+
+
 def remove_readonly_tree(path: Path) -> None:
     """Remove a snapshot tree whose files/dirs were made read-only (0o444/0o555).
 
