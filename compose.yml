@@ -17,14 +17,20 @@ services:
       DATABASE_URL: postgresql+psycopg://platelens:${POSTGRES_PASSWORD:-platelens-local}@db:5432/platelens
       REDIS_URL: redis://redis:6379/0
       DATA_DIR: /data
-      RAW_IMAGES_DIR: /rawimages
+      DATASETS_DIR: /datasets
       LEGACY_LABELS_DIRS: /legacy-labels:/legacy-volume
       TRAINING_DIR: /training
+      RAW_OCR_DATASET_DIR: /raw-dataset-ocr
+      VERIFIED_DETECTOR_DATASET_DIR: /verified-dataset-detector
+      VERIFIED_OCR_DATASET_DIR: /verified-dataset-ocr
     volumes:
       - ./docker/models:/home/app/.cache
       - ./docker/storage:/data
+      - ./datasets:/datasets
       - ./docker/training:/training
-      - ./rawimages:/rawimages:ro
+      - ./raw-dataset-ocr:/raw-dataset-ocr
+      - ./verified-dataset-detector:/verified-dataset-detector
+      - ./verified-dataset-ocr:/verified-dataset-ocr
       - ./docker/labels:/legacy-labels:ro
       - label-data:/legacy-volume:ro
     depends_on:
@@ -47,13 +53,19 @@ services:
       DATABASE_URL: postgresql+psycopg://platelens:${POSTGRES_PASSWORD:-platelens-local}@db:5432/platelens
       REDIS_URL: redis://redis:6379/0
       DATA_DIR: /data
-      RAW_IMAGES_DIR: /rawimages
+      DATASETS_DIR: /datasets
+      VERIFIED_DETECTOR_DATASET_DIR: /verified-dataset-detector
+      RAW_OCR_DATASET_DIR: /raw-dataset-ocr
+      VERIFIED_OCR_DATASET_DIR: /verified-dataset-ocr
       TRAINING_DIR: /training
     volumes:
       - ./docker/models:/home/app/.cache
       - ./docker/storage:/data
+      - ./datasets:/datasets
       - ./docker/training:/training
-      - ./rawimages:/rawimages:ro
+      - ./verified-dataset-detector:/verified-dataset-detector
+      - ./raw-dataset-ocr:/raw-dataset-ocr
+      - ./verified-dataset-ocr:/verified-dataset-ocr
     depends_on:
       db:
         condition: service_healthy

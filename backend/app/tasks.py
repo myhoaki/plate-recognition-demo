@@ -31,7 +31,7 @@ def run_detection_job(job_id: str):
                     Annotation.ai_detection.is_(True)
                 )
                 if job.kind == "batch":
-                    detected_query = detected_query.join(ImageRecord).where(ImageRecord.source == "rawimages")
+                    detected_query = detected_query.join(ImageRecord).where(ImageRecord.source == "registered")
                 elif image_ids:
                     detected_query = detected_query.where(Annotation.image_id == image_ids[0])
                 job.detected = db.scalar(detected_query) or 0

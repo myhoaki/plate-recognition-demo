@@ -1,8 +1,15 @@
-# Imported datasets and raw image collection
+# Imported datasets and generated training datasets
 /rawimages/
+/raw-dataset-ocr/*
+!/raw-dataset-ocr/.gitkeep
+/verified-dataset-detector/*
+!/verified-dataset-detector/.gitkeep
+/verified-dataset-ocr/*
+!/verified-dataset-ocr/.gitkeep
 /car-plate-detection-dataset/
 /dataset/
-/datasets/
+/datasets/*
+!/datasets/.gitkeep
 
 # Runtime data and generated model/label files
 /docker/storage/

@@ -7,8 +7,10 @@ from fastapi import HTTPException, UploadFile
 
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
+DATASETS_DIR = Path(os.environ.get("DATASETS_DIR", DATA_DIR / "datasets"))
+DATASETS_IMPORTS_DIR = DATASETS_DIR / "imports"
 UPLOADS_DIR = DATA_DIR / "uploads"
-RAW_IMAGES_DIR = Path(os.environ.get("RAW_IMAGES_DIR", "/data/rawimages"))
+RAW_IMAGES_DIR = Path(os.environ.get("RAW_IMAGES_DIR", "/raw-dataset-detector"))
 LEGACY_LABELS_DIRS = [
     Path(item)
     for item in os.environ.get("LEGACY_LABELS_DIRS", "/legacy-labels:/legacy-volume").split(":")
@@ -64,7 +66,21 @@ async def save_upload(upload: UploadFile, storage_key: str) -> tuple[Path, str, 
 
 
 def image_path(source: str, filename: str, storage_key: str) -> Path:
-    if storage_key.startswith("uploads/"):
+    if storage_key.startswith("datasets/raw/"):
+        relative = Path(storage_key).relative_to("datasets/raw")
+        path = (DATASETS_DIR / "raw" / relative).resolve()
+        try:
+            path.relative_to((DATASETS_DIR / "raw").resolve())
+        except ValueError:
+            raise FileNotFoundError("Dataset image path is outside canonical storage") from None
+    elif storage_key.startswith("datasets/imports/"):
+        relative = Path(storage_key).relative_to("datasets/imports")
+        path = (DATASETS_IMPORTS_DIR / relative).resolve()
+        try:
+            path.relative_to(DATASETS_IMPORTS_DIR.resolve())
+        except ValueError:
+            raise FileNotFoundError("Dataset imports image path is outside canonical storage") from None
+    elif storage_key.startswith("uploads/"):
         path = DATA_DIR / storage_key
     elif source == "rawimages":
         path = RAW_IMAGES_DIR / Path(filename).name

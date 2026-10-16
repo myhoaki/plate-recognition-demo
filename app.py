@@ -25,7 +25,7 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 MAX_IMAGE_PIXELS = 40_000_000
 LABELS_DIR = Path(os.environ.get("LABELS_DIR", Path(__file__).parent / "docker" / "labels"))
 LEGACY_LABELS_DIR = Path(os.environ.get("LEGACY_LABELS_DIR", "/legacy-labels"))
-RAW_IMAGES_DIR = Path(os.environ.get("RAW_IMAGES_DIR", Path(__file__).parent / "rawimages"))
+RAW_IMAGES_DIR = Path(os.environ.get("RAW_IMAGES_DIR", Path(__file__).parent / "raw-dataset-detector"))
 inference_lock = Lock()
 label_save_lock = RLock()
 migration_lock = Lock()
@@ -337,7 +337,7 @@ def detect_plates_for_labeling():
     if source_type == "rawimages":
         filename = request.form.get("rawimage", "")
         if Path(filename).name != filename or filename not in available_raw_images():
-            return jsonify(error="Choose an image from the rawimages folder."), 400
+            return jsonify(error="Choose an image from raw-dataset-detector/"), 400
         source_path = RAW_IMAGES_DIR / filename
         if source_path.stat().st_size > 15 * 1024 * 1024:
             return jsonify(error="Image is too large. The limit is 15 MB."), 400
@@ -401,7 +401,7 @@ def save_label():
     if source_type == "rawimages":
         original_filename = request.form.get("rawimage", "")
         if Path(original_filename).name != original_filename or original_filename not in available_raw_images():
-            return jsonify(error="Choose an image from the rawimages folder."), 400
+            return jsonify(error="Choose an image from raw-dataset-detector/"), 400
         source_path = RAW_IMAGES_DIR / original_filename
         if source_path.stat().st_size > 15 * 1024 * 1024:
             return jsonify(error="Image is too large. The limit is 15 MB."), 400

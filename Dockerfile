@@ -2,7 +2,8 @@ FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    HOME=/home/app
+    HOME=/home/app \
+    RAW_IMAGES_DIR=/data/raw-dataset-detector
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libgomp1 libglib2.0-0 libgl1 \
@@ -18,7 +19,7 @@ RUN python -m pip install --no-cache-dir -r requirements.txt
 COPY --chown=app:app app.py main.py ./
 COPY --chown=app:app templates ./templates
 COPY --chown=app:app static ./static
-RUN mkdir -p /home/app/.cache /data/labels /data/rawimages \
+RUN mkdir -p /home/app/.cache /data/labels /data/raw-dataset-detector \
     && chown -R app:app /home/app /data
 RUN chmod 755 /home/app
 

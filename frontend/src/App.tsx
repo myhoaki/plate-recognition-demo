@@ -1,18 +1,22 @@
 import { Fragment, type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Circle, Image as KImage, Layer, Rect, Stage, Text } from 'react-konva';
 import type Konva from 'konva';
+import RecognitionTest from './RecognitionTest';
+import OCRDatasetReview from './OCRDatasetReview';
 
 type Annotation = {
   id?: number; bbox_xyxy_pixels: number[]; ai_detection: boolean; ai_result?: string | null;
   verified_result?: string | null; detection_confidence?: number | null; ocr_confidence?: number | null;
   country?: string | null; country_confidence?: number | null;
 };
-type ReviewStatus = 'needs_review' | 'verified' | 'rejected' | 'no_plate';
+type ReviewStatus = 'needs_review' | 'reviewed' | 'verified' | 'rejected' | 'no_plate';
+type AppSection = 'production' | 'detector' | 'ocr' | 'recognition';
+type DatasetSnapshot = { id: string; task: 'detector' | 'ocr'; split_counts: Record<string, number>; manifest_sha256: string; created_at: string };
+type DashboardMetrics = { total_images: number; verified_plates: number; images_needing_review: number; ocr_exact_match_accuracy: number | null; character_error_rate: number | null; detection_recall: number | null };
 type ImageRecord = { id: string; filename: string; width: number; height: number; detection_complete: boolean; verified: boolean; review_status: ReviewStatus; verified_at?: string | null; file_url: string; annotations?: Annotation[] };
 type Job = { job_id?: string; id?: string; kind?: 'single' | 'batch'; status: string; total: number; completed: number; detected: number; failed: number; error?: string | null; existing?: boolean };
-type TrainingJob = { id: string; status: string; config: { epochs: number; batch_size: number; image_size: number; device: string }; split_counts: Record<string, number>; current_epoch: number; total_epochs: number; metrics: Record<string, number>; model_ready: boolean; error?: string | null };
-type DashboardMetrics = { total_images: number; verified_plates: number; images_needing_review: number; ocr_evaluated_plates: number; ocr_exact_match_accuracy: number | null; character_error_rate: number | null; detection_evaluated_plates: number; detection_recall: number | null };
-type RefreshState = { running: boolean; processed: number; total: number; added_or_changed: number; error?: string | null };
+type EpochStats = { epoch: number; is_best?: boolean; [key: string]: number | boolean | undefined };
+type TrainingJob = { id: string; status: string; model_type: 'detector' | 'ocr'; cancel_requested: boolean; config: { epochs: number; batch_size: number; image_size?: number; device: string }; split_counts: Record<string, number>; current_epoch: number; total_epochs: number; current_batch: number; total_batches: number; current_val: number; total_val: number; current_test: number; total_test: number; metrics: Record<string, number>; epoch_history: EpochStats[]; best_epoch: number | null; best_score: number | null; best_metrics: Record<string, number>; model_ready: boolean; error?: string | null };
 type Box = { bbox_xyxy_pixels: number[]; verified_result: string; ai_detection: boolean; ai_result?: string | null; detection_confidence?: number | null; ocr_confidence?: number | null; country?: string | null; country_confidence?: number | null };
 const PAGE_SIZE = 500;
 
@@ -50,7 +54,9 @@ export default function App() {
   const [imageTotal, setImageTotal] = useState(0);
   const [pageOffset, setPageOffset] = useState(0);
   const [jumpOrder, setJumpOrder] = useState('1');
-  const [source, setSource] = useState<'rawimages' | 'upload'>('rawimages');
+  const [section, setSection] = useState<AppSection>('production');
+  const [source, setSource] = useState<'registered' | 'datasets_folder'>('datasets_folder');
+  const [syncing, setSyncing] = useState(false);
   const [confidenceReview, setConfidenceReview] = useState<'all' | 'detector' | 'ocr' | 'both'>('all');
   const [confidenceThreshold, setConfidenceThreshold] = useState(0.7);
   const [statusFilter, setStatusFilter] = useState<'all' | ReviewStatus>('all');
@@ -64,9 +70,11 @@ export default function App() {
   const [message, setMessage] = useState('');
   const [job, setJob] = useState<Job | null>(null);
   const [activeJobs, setActiveJobs] = useState<Job[]>([]);
-  const [dashboardMetrics, setDashboardMetrics] = useState<DashboardMetrics | null>(null);
-  const [trainingJob, setTrainingJob] = useState<TrainingJob | null>(null);
-  const [showTrainingForm, setShowTrainingForm] = useState(false);
+  const [detectorTrainingJob, setDetectorTrainingJob] = useState<TrainingJob | null>(null);
+  const [ocrTrainingJob, setOcrTrainingJob] = useState<TrainingJob | null>(null);
+  const [snapshots, setSnapshots] = useState<DatasetSnapshot[]>([]);
+  const [datasetMetrics, setDatasetMetrics] = useState<DashboardMetrics | null>(null);
+  const [selectedSnapshot, setSelectedSnapshot] = useState({ detector: '', ocr: '' });
   const [trainingConfig, setTrainingConfig] = useState({ epochs: 30, batch_size: 8, image_size: 640, device: 'auto' });
   const [drawing, setDrawing] = useState<number[] | null>(null);
   const [selectedBoxIndex, setSelectedBoxIndex] = useState<number | null>(null);
@@ -76,32 +84,57 @@ export default function App() {
   const current = images[index];
   const jobActive = job?.status === 'queued' || job?.status === 'running';
   const batchActive = activeJobs.some((item) => item.kind === 'batch');
+  const trainingType = section === 'ocr' ? 'ocr' : 'detector';
+  const trainingJob = section === 'ocr' ? ocrTrainingJob : detectorTrainingJob;
+  const anyTrainingActive = [detectorTrainingJob, ocrTrainingJob].some((item) => item?.status === 'queued' || item?.status === 'running');
   const trainingActive = trainingJob?.status === 'queued' || trainingJob?.status === 'running';
 
   useEffect(() => {
     let cancelled = false;
-    api<{ job: TrainingJob | null }>('/api/training-jobs/latest').then((result) => {
-      if (!cancelled && result.job) setTrainingJob(result.job);
+    Promise.all([
+      api<{ job: TrainingJob | null }>('/api/training-jobs/latest?model_type=detector'),
+      api<{ job: TrainingJob | null }>('/api/training-jobs/latest?model_type=ocr'),
+    ]).then(([detector, ocr]) => {
+      if (cancelled) return;
+      setDetectorTrainingJob(detector.job);
+      setOcrTrainingJob(ocr.job);
     }).catch(() => undefined);
     return () => { cancelled = true; };
   }, []);
 
+  const refreshSnapshots = useCallback(async () => {
+    const data = await api<{ snapshots: DatasetSnapshot[] }>('/api/dataset-snapshots');
+    setSnapshots(data.snapshots);
+    setSelectedSnapshot((old) => ({
+      detector: old.detector || data.snapshots.find((item) => item.task === 'detector')?.id || '',
+      ocr: old.ocr || data.snapshots.find((item) => item.task === 'ocr')?.id || '',
+    }));
+  }, []);
+  useEffect(() => { void refreshSnapshots().catch(() => undefined); }, [refreshSnapshots]);
+  const refreshDatasetMetrics = useCallback(async () => setDatasetMetrics(await api<DashboardMetrics>('/api/metrics')), []);
+  useEffect(() => { void refreshDatasetMetrics().catch(() => undefined); }, [refreshDatasetMetrics]);
+
   useEffect(() => {
-    if (!trainingJob?.id || !trainingActive) return;
     let cancelled = false;
-    let timer = 0;
-    const poll = async () => {
-      try {
-        const state = await api<TrainingJob>(`/api/training-jobs/${trainingJob.id}`);
-        if (cancelled) return;
-        setTrainingJob(state);
-        if (state.status === 'queued' || state.status === 'running') timer = window.setTimeout(poll, 2000);
-        else setMessage(state.status === 'completed' ? 'Training completed. Review the test metrics, then activate the model if you want to use it.' : `Training ${state.status}: ${state.error || 'see training details.'}`);
-      } catch { if (!cancelled) timer = window.setTimeout(poll, 4000); }
+    const timers: number[] = [];
+    const poll = (job: TrainingJob, update: (job: TrainingJob) => void) => {
+      if (job.status !== 'queued' && job.status !== 'running') return;
+      let timer = 0;
+      const refresh = async () => {
+        try {
+          const state = await api<TrainingJob>(`/api/training-jobs/${job.id}`);
+          if (cancelled) return;
+          update(state);
+          if (state.status === 'queued' || state.status === 'running') timer = window.setTimeout(refresh, 2000);
+        } catch { if (!cancelled) timer = window.setTimeout(refresh, 4000); }
+      };
+      timer = window.setTimeout(refresh, 1000);
+      timers.push(timer);
     };
-    timer = window.setTimeout(poll, 1000);
-    return () => { cancelled = true; window.clearTimeout(timer); };
-  }, [trainingJob?.id, trainingActive]);
+    if (detectorTrainingJob) poll(detectorTrainingJob, setDetectorTrainingJob);
+    if (ocrTrainingJob) poll(ocrTrainingJob, setOcrTrainingJob);
+    return () => { cancelled = true; timers.forEach((timer) => window.clearTimeout(timer)); };
+  }, [detectorTrainingJob?.id, detectorTrainingJob?.status, ocrTrainingJob?.id, ocrTrainingJob?.status]);
 
   useEffect(() => {
     let cancelled = false;
@@ -151,13 +184,6 @@ export default function App() {
     setIndex(nextIndex >= 0 ? nextIndex : 0);
   }, [source, confidenceReview, confidenceThreshold, statusFilter]);
 
-  const loadMetrics = useCallback(async () => {
-    try { setDashboardMetrics(await api<DashboardMetrics>('/api/metrics')); }
-    catch { /* Keep the last successful metrics if a refresh fails. */ }
-  }, []);
-
-  useEffect(() => { void loadMetrics(); }, [loadMetrics]);
-
   useEffect(() => {
     if (!job?.id || (job.status !== 'queued' && job.status !== 'running')) return;
     let cancelled = false;
@@ -174,11 +200,14 @@ export default function App() {
         }
         window.localStorage.removeItem('platelens.activeDetectionJob');
         setMessage(`Detection ${state.status}: ${state.completed}/${state.total} images, ${state.detected} with plates, ${state.failed} failed.`);
-        await loadImages(source, current?.id, pageOffset);
-        void loadMetrics();
         if (current) {
           const detail = await api<ImageRecord>(`/api/images/${current.id}`);
-          if (!cancelled) setBoxes((detail.annotations || []).map((a) => ({ ...a, verified_result: a.verified_result || '' })));
+          if (!cancelled) {
+            // Keep the reviewed image selected if its updated confidence/status makes it
+            // fall out of the active review filter after detection.
+            setImages((all) => all.map((item) => item.id === detail.id ? { ...item, ...detail } : item));
+            setBoxes((detail.annotations || []).map((a) => ({ ...a, verified_result: a.verified_result || '' })));
+          }
         }
       } catch (e) {
         if (!cancelled) {
@@ -189,7 +218,7 @@ export default function App() {
     };
     timer = window.setTimeout(poll, 900);
     return () => { cancelled = true; window.clearTimeout(timer); };
-  }, [job?.id, job?.status, source, pageOffset, current?.id, loadImages, loadMetrics]);
+  }, [job?.id, job?.status, source, pageOffset, current?.id, loadImages]);
 
   useEffect(() => {
     let active = true;
@@ -258,32 +287,27 @@ export default function App() {
       setBusy(false);
     }
   };
-  const changeSource = async (value: 'rawimages' | 'upload') => { setSource(value); setIndex(0); setBoxes([]); setMessage(''); await loadImages(value, undefined, 0); };
-  const upload = async (file?: File) => {
-    if (!file) return;
-    setBusy(true); setMessage('Uploading image…');
+  const reloadRegisteredImages = async () => {
+    setBusy(true); setMessage('Loading imported dataset…');
     try {
-      const form = new FormData(); form.append('file', file);
-      const created = await api<ImageRecord>('/api/images/upload', { method: 'POST', body: form });
-      setSource('upload'); await loadImages('upload', created.id); setMessage('Image uploaded.');
-      void loadMetrics();
+      await loadImages(source, current?.id, pageOffset);
+      setMessage('Imported dataset reloaded.');
     } catch (e) { setMessage((e as Error).message); } finally { setBusy(false); }
   };
-  const refresh = async () => {
-    setBusy(true); setMessage('Scanning rawimages/…');
+  const syncDatasetsFolder = async () => {
+    setSyncing(true); setMessage('Scanning datasets/imports/ folder…');
     try {
-      await api<RefreshState>('/api/images/refresh', { method: 'POST' });
-      let result = await api<RefreshState>('/api/images/refresh');
-      while (result.running) {
-        setMessage(`Scanning rawimages/… ${result.processed.toLocaleString()} / ${result.total.toLocaleString()}`);
-        await new Promise((resolve) => window.setTimeout(resolve, 1500));
-        result = await api<RefreshState>('/api/images/refresh');
-      }
-      if (result.error) throw new Error(result.error);
-      await loadImages('rawimages', current?.id, pageOffset);
-      void loadMetrics();
-      setMessage(`Gallery refreshed. ${result.added_or_changed.toLocaleString()} new or changed images.`);
-    } catch (e) { setMessage((e as Error).message); } finally { setBusy(false); }
+      const result = await api<{ synced: number; total: number }>('/api/images/sync-datasets-folder', { method: 'POST' });
+      setMessage(`Sync complete: ${result.synced} new/updated image${result.synced === 1 ? '' : 's'}, ${result.total} total.`);
+      await loadImages('datasets_folder', undefined, 0);
+    } catch (e) { setMessage((e as Error).message); } finally { setSyncing(false); }
+  };
+  const switchSource = async (next: 'registered' | 'datasets_folder') => {
+    if (next === source) return;
+    setSource(next);
+    setPageOffset(0);
+    setIndex(0);
+    setMessage('');
   };
   const detect = async (batch = false) => {
     if (!batch && !current) return;
@@ -303,23 +327,43 @@ export default function App() {
   };
   const startTraining = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    setBusy(true); setMessage('Queueing detector training…');
+    if (!selectedSnapshot[trainingType]) { setMessage(`Create or select a ${trainingType} dataset snapshot first.`); return; }
+    setBusy(true); setMessage(`Queueing ${trainingType} training…`);
     try {
       const job = await api<TrainingJob>('/api/training-jobs', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(trainingConfig),
+        body: JSON.stringify({ ...trainingConfig, model_type: trainingType, dataset_snapshot_id: selectedSnapshot[trainingType] }),
       });
-      setTrainingJob(job);
-      setShowTrainingForm(false);
-      setMessage(job.status === 'running' ? 'Detector training is already running.' : 'Detector training queued. It continues on the server if you close this page.');
+      if (trainingType === 'ocr') setOcrTrainingJob(job);
+      else setDetectorTrainingJob(job);
+      setMessage(job.status === 'running' ? `${job.model_type} training is already running.` : `${job.model_type} training queued. It continues on the server if you close this page.`);
     } catch (e) { setMessage((e as Error).message); } finally { setBusy(false); }
   };
-  const activateModel = async () => {
-    if (!trainingJob) return;
+  const createSnapshot = async (task: 'detector' | 'ocr') => {
+    setBusy(true); setMessage(`Creating ${task} dataset snapshot…`);
+    try {
+      const snapshot = await api<DatasetSnapshot>(`/api/dataset-snapshots?task=${task}`, { method: 'POST' });
+      setSnapshots((items) => [snapshot, ...items]);
+      setSelectedSnapshot((old) => ({ ...old, [task]: snapshot.id }));
+      setMessage(`${task} snapshot created · ${snapshot.split_counts.train} train, ${snapshot.split_counts.val} validation, ${snapshot.split_counts.test} test.`);
+    } catch (e) { setMessage((e as Error).message); }
+    finally { setBusy(false); }
+  };
+  const activateModel = async (target: TrainingJob) => {
     setBusy(true);
     try {
-      await api(`/api/training-jobs/${trainingJob.id}/activate`, { method: 'POST' });
-      setMessage('Trained detector activated. New detections will use it with the existing OCR model.');
+      await api(`/api/training-jobs/${target.id}/activate`, { method: 'POST' });
+      setMessage(`Trained ${target.model_type} activated. New detections will use it.`);
+    } catch (e) { setMessage((e as Error).message); } finally { setBusy(false); }
+  };
+  const cancelTraining = async (target: TrainingJob) => {
+    if (!trainingActive) return;
+    setBusy(true);
+    try {
+      const stopped = await api<TrainingJob>(`/api/training-jobs/${target.id}/cancel`, { method: 'POST' });
+      if (target.model_type === 'ocr') setOcrTrainingJob(stopped);
+      else setDetectorTrainingJob(stopped);
+      setMessage(stopped.status === 'cancelled' ? 'Training stopped.' : 'Stop requested. Training will stop after the current batch.');
     } catch (e) { setMessage((e as Error).message); } finally { setBusy(false); }
   };
   const save = async () => {
@@ -334,7 +378,7 @@ export default function App() {
       setDirtyImageId(null);
       setImages((all) => all.map((item) => item.id === current.id ? { ...item, verified: false, review_status: saved.image.review_status, verified_at: null } : item));
       setBoxes((saved.image.annotations || []).map((a) => ({ ...a, verified_result: a.verified_result || '' })));
-      void loadMetrics();
+      void refreshDatasetMetrics().catch(() => undefined);
     } catch (e) { setMessage((e as Error).message); } finally { setBusy(false); }
   };
   const setReviewStatus = async (status: ReviewStatus) => {
@@ -346,8 +390,8 @@ export default function App() {
       });
       setImages((all) => all.map((item) => item.id === current.id ? { ...item, verified: result.image.verified, review_status: result.image.review_status, verified_at: result.image.verified_at } : item));
       setMessage(`Image status set to ${status.replace('_', ' ')}.`);
+      void refreshDatasetMetrics().catch(() => undefined);
       await loadImages(source, current.id, pageOffset);
-      void loadMetrics();
     } catch (e) { setMessage((e as Error).message); } finally { setBusy(false); }
   };
   const markVerified = async () => {
@@ -416,6 +460,7 @@ export default function App() {
     const handleShortcut = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
       const editing = !!target?.closest('input, textarea, select, [contenteditable="true"]');
+      if (section !== 'production') return;
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
         event.preventDefault(); void save(); return;
       }
@@ -433,52 +478,106 @@ export default function App() {
     };
     window.addEventListener('keydown', handleShortcut);
     return () => window.removeEventListener('keydown', handleShortcut);
-  }, [current?.id, boxes.length, selectedBoxIndex, save, markVerified, move, removeBox]);
+  }, [section, current?.id, boxes.length, selectedBoxIndex, save, markVerified, move, removeBox]);
 
-  return <main className="app-shell">
-    <header className="topbar"><div><h1>PlateLens</h1><p>License plate detection and annotation</p></div>
-      <div className="top-actions"><label className="upload button">Upload image<input type="file" accept="image/*" onChange={(e) => upload(e.target.files?.[0])} /></label>
-        <button onClick={() => setShowTrainingForm((value) => !value)} disabled={busy || trainingActive}>Train detector</button>
-        <button onClick={() => detect(true)} disabled={busy || batchActive || trainingActive}>Detect all raw images</button></div>
-    </header>
-    {showTrainingForm && <section className="training-panel">
-      <form onSubmit={startTraining}>
+  const renderTrainingSection = (type: 'detector' | 'ocr', trained: TrainingJob | null) => {
+    const isOcr = type === 'ocr';
+    const isActive = trained?.status === 'queued' || trained?.status === 'running';
+    const otherTrainingActive = [detectorTrainingJob, ocrTrainingJob].some((item) => item?.model_type !== type && (item?.status === 'queued' || item?.status === 'running'));
+    const units = isOcr ? 'plate crops' : 'images';
+    return <section className={`training-page ${isOcr ? 'ocr-training-page' : 'detector-training-page'}`}>
+      <header className="training-page-head">
+        <div><h2>{isOcr ? 'OCR training' : 'Detection training'}</h2>
+          <p>{isOcr ? 'Train character recognition from cropped license plates.' : 'Train plate localization: find the plate position in each image.'}</p></div>
+        {trained?.model_ready && <button onClick={() => void activateModel(trained)} disabled={busy}>Activate {isOcr ? 'OCR' : 'detector'} model</button>}
+      </header>
+      <form className="training-config" onSubmit={startTraining}>
+        <label>Dataset snapshot<select value={selectedSnapshot[type]} onChange={(e) => setSelectedSnapshot((old) => ({ ...old, [type]: e.target.value }))} required>
+          <option value="">Create a snapshot first</option>{snapshots.filter((item) => item.task === type).map((item) => <option key={item.id} value={item.id}>{item.id.slice(0, 8)} · {item.split_counts.train || 0}/{item.split_counts.val || 0}/{item.split_counts.test || 0} train/val/test</option>)}
+        </select></label>
+        <button type="button" onClick={() => void createSnapshot(type)} disabled={busy}>Create snapshot</button>
         <label>Epochs<input type="number" min="1" max="300" value={trainingConfig.epochs} onChange={(e) => setTrainingConfig({ ...trainingConfig, epochs: Number(e.target.value) })} /></label>
         <label>Batch size<input type="number" min="1" max="64" value={trainingConfig.batch_size} onChange={(e) => setTrainingConfig({ ...trainingConfig, batch_size: Number(e.target.value) })} /></label>
-        <label>Image size<input type="number" min="320" max="1280" step="32" value={trainingConfig.image_size} onChange={(e) => setTrainingConfig({ ...trainingConfig, image_size: Number(e.target.value) })} /></label>
-        <span className="split-note">Verified images split: 80% train · 10% validation · 10% test</span>
-        <button className="primary" type="submit" disabled={busy || trainingActive}>Start training</button>
+        {!isOcr && <label>Image size<input type="number" min="320" max="1280" step="32" value={trainingConfig.image_size} onChange={(e) => setTrainingConfig({ ...trainingConfig, image_size: Number(e.target.value) })} /></label>}
+        <button className="primary" type="submit" disabled={busy || isActive || otherTrainingActive || !selectedSnapshot[type]}>Start {isOcr ? 'OCR' : 'detector'} training</button>
       </form>
-      <p>Only images marked Verified are included. At least 3 verified images are required.</p>
-    </section>}
-    {trainingJob && <section className="training-status" aria-live="polite">
-      <div className="training-status-head"><strong>Detector training · {trainingJob.status}</strong>
-        {trainingJob.model_ready && <button onClick={activateModel} disabled={busy}>Use this model</button>}
+      {otherTrainingActive && <p className="training-source-note">Another training run is active. Wait for it to finish before starting this one.</p>}
+      <p className="training-source-note">{isOcr
+        ? 'Snapshot source: verified OCR text from imported OCR data and verified plate annotations. Crops from one source image stay in the same split.'
+        : 'Snapshot source: verified plate boxes in the selected immutable detector dataset snapshot.'}</p>
+      {isOcr && <OCRDatasetReview />}
+      {trained ? <section className="training-status" aria-live="polite">
+        <div className="training-status-head"><strong>{isOcr ? 'OCR' : 'Detector'} · {trained.status}</strong>
+          {isActive && <button className="stop-training" onClick={() => void cancelTraining(trained)} disabled={busy || trained.cancel_requested}>{trained.cancel_requested ? 'Stopping…' : 'Stop training'}</button>}
+        </div>
+        {trained.split_counts && Object.keys(trained.split_counts).length > 0 && <div className="training-splits">
+          <label>Train · epoch {trained.current_epoch} / {trained.total_epochs} · batch {trained.total_batches ? `${trained.current_batch} / ${trained.total_batches}` : 'preparing'} · {Math.min(trained.split_counts.train || 0, trained.current_batch * trained.config.batch_size).toLocaleString()} / {(trained.split_counts.train || 0).toLocaleString()} {units} this epoch
+            <progress value={Math.min(trained.split_counts.train || 0, trained.current_batch * trained.config.batch_size)} max={trained.split_counts.train || 1} />
+          </label>
+          <label>Validation · {Math.min(trained.current_val || 0, trained.total_val || trained.split_counts.val || 0).toLocaleString()} / {(trained.total_val || trained.split_counts.val || 0).toLocaleString()} {units}
+            <progress value={trained.current_val || 0} max={trained.total_val || trained.split_counts.val || 1} />
+          </label>
+          <label>Test · {Math.min(trained.current_test || 0, trained.total_test || trained.split_counts.test || 0).toLocaleString()} / {(trained.total_test || trained.split_counts.test || 0).toLocaleString()} {units}
+            <progress value={trained.current_test || 0} max={trained.total_test || trained.split_counts.test || 1} />
+          </label>
+        </div>}
+        {trained.cancel_requested && isActive && <span>Stop requested. Waiting for the current batch to finish…</span>}
+        {!isOcr && trained.metrics['metrics/mAP50(B)'] != null && <div className="training-metric-grid">
+          <div><small>{isActive ? 'Latest validation' : 'Held-out test'} mAP50</small><b>{percent(trained.metrics['metrics/mAP50(B)'])}</b></div>
+          <div><small>mAP50–95</small><b>{percent(trained.metrics['metrics/mAP50-95(B)'])}</b></div>
+          <div><small>Precision</small><b>{percent(trained.metrics['metrics/precision(B)'])}</b></div>
+          <div><small>Recall</small><b>{percent(trained.metrics['metrics/recall(B)'])}</b></div>
+        </div>}
+        {isOcr && trained.metrics.val_plate_accuracy != null && <div className="training-metric-grid">
+          <div><small>Validation exact plate</small><b>{percent(trained.metrics.val_plate_accuracy)}</b></div>
+          <div><small>Validation CER</small><b>{percent(trained.metrics.val_character_error_rate)}</b></div>
+          {trained.metrics.test_plate_accuracy != null && <div><small>Test exact plate</small><b>{percent(trained.metrics.test_plate_accuracy)}</b></div>}
+          {trained.metrics.test_character_error_rate != null && <div><small>Test CER</small><b>{percent(trained.metrics.test_character_error_rate)}</b></div>}
+        </div>}
+        {trained.epoch_history?.length > 0 && <div className="epoch-history">
+          <strong>Epoch statistics · best epoch {trained.best_epoch ?? '—'}</strong>
+          <div className="epoch-history-list">{trained.epoch_history.map((row) => <div className="epoch-history-row" key={row.epoch}>
+            <b>Epoch {row.epoch}{row.is_best ? ' · Best' : ''}</b>
+            {isOcr
+              ? <span>Loss {(Number(row.train_loss) || 0).toFixed(4)} · Exact {percent(Number(row.val_plate_accuracy) || 0)} · CER {percent(Number(row.val_character_error_rate) || 0)}</span>
+              : <span>mAP50 {percent(Number(row['metrics/mAP50(B)']) || 0)} · mAP50–95 {percent(Number(row['metrics/mAP50-95(B)']) || 0)} · Precision {percent(Number(row['metrics/precision(B)']) || 0)} · Recall {percent(Number(row['metrics/recall(B)']) || 0)}</span>}
+          </div>)}</div>
+        </div>}
+        {trained.model_ready && <small>Best checkpoint saved as <code>best.pt</code>; future runs start from the retained best weights.</small>}
+        {trained.error && <span className="training-error">{trained.error}</span>}
+      </section> : <section className="training-status training-empty"><strong>No {isOcr ? 'OCR' : 'detector'} training run yet</strong><span>Configure the run above to begin. Epoch statistics and split progress will appear here.</span></section>}
+    </section>;
+  };
+
+  return <main className="app-shell">
+    <header className="topbar app-header"><div><h1>PlateLens</h1><p>License plate production and training</p></div>
+      <nav className="section-tabs" aria-label="Application sections">
+        {([['production', 'Verify Datasets'], ['detector', 'Train Detection'], ['ocr', 'Train OCR'], ['recognition', 'Recognition / Test']] as const).map(([id, label]) => <button key={id} className={section === id ? 'active' : ''} onClick={() => { setSection(id); setMessage(''); }}>{label}</button>)}
+      </nav>
+    </header>
+    {section === 'production' && <>
+    <div className="production-heading"><div><h2>Verify Datasets</h2><p>Review images and verify plate boxes before creating training snapshots.</p></div>
+      <div className="snapshot-actions">
+        <div className="source-tabs" role="tablist" aria-label="Image source">
+          <button role="tab" aria-selected={source === 'datasets_folder'} className={source === 'datasets_folder' ? 'active' : ''} onClick={() => void switchSource('datasets_folder')}>datasets/ folder</button>
+          <button role="tab" aria-selected={source === 'registered'} className={source === 'registered' ? 'active' : ''} onClick={() => void switchSource('registered')}>Registry imports</button>
+        </div>
+        {source === 'datasets_folder' && <button onClick={() => void syncDatasetsFolder()} disabled={busy || syncing}>{syncing ? 'Scanning…' : 'Sync from datasets/ folder'}</button>}
+        <button onClick={() => void createSnapshot('detector')} disabled={busy}>Snapshot verified detector data</button>
+        <button onClick={() => void createSnapshot('ocr')} disabled={busy}>Snapshot verified OCR data</button>
+        <button onClick={() => void detect(true)} disabled={busy || batchActive || anyTrainingActive}>Detect all images</button>
       </div>
-      {trainingActive && <><span>Epoch {trainingJob.current_epoch} / {trainingJob.total_epochs} · batch {trainingJob.config.batch_size}</span><progress value={trainingJob.current_epoch} max={trainingJob.total_epochs || 1} /></>}
-      {Object.keys(trainingJob.split_counts).length > 0 && <span>Train {trainingJob.split_counts.train} · Validation {trainingJob.split_counts.val} · Test {trainingJob.split_counts.test}</span>}
-      {trainingJob.metrics['metrics/mAP50(B)'] != null && <span>{trainingActive ? 'Validation' : 'Test'} mAP50: {(trainingJob.metrics['metrics/mAP50(B)'] * 100).toFixed(1)}% · mAP50–95: {((trainingJob.metrics['metrics/mAP50-95(B)'] || 0) * 100).toFixed(1)}%</span>}
-      {trainingJob.error && <span className="training-error">{trainingJob.error}</span>}
-    </section>}
+    </div>
+    <section className="snapshot-list"><strong>Immutable snapshots</strong>{snapshots.length ? snapshots.map((item) => <span key={item.id}><b>{item.task}</b> · {item.id.slice(0, 8)} · {item.split_counts.train}/{item.split_counts.val}/{item.split_counts.test} train/val/test · {item.manifest_sha256.slice(0, 12)}</span>) : <span>No snapshots created yet.</span>}</section>
+    {datasetMetrics && <section className="metrics-dashboard dataset-dashboard"><div className="metric"><span>Total images</span><strong>{datasetMetrics.total_images.toLocaleString()}</strong></div><div className="metric"><span>Verified plates</span><strong>{datasetMetrics.verified_plates.toLocaleString()}</strong></div><div className="metric"><span>Needs review</span><strong>{datasetMetrics.images_needing_review.toLocaleString()}</strong></div><div className="metric"><span>OCR exact match</span><strong>{percent(datasetMetrics.ocr_exact_match_accuracy)}</strong></div><div className="metric"><span>Character error rate</span><strong>{percent(datasetMetrics.character_error_rate)}</strong></div><div className="metric"><span>Detection recall</span><strong>{percent(datasetMetrics.detection_recall)}</strong></div><button className="metrics-refresh" onClick={() => void refreshDatasetMetrics()} disabled={busy}>Refresh statistics</button></section>}
     {activeJobs.length > 0 && <section className="queue-status" aria-live="polite">
-      <strong>Detection queue</strong>
-      {activeJobs.map((item) => <div className="queue-item" key={item.id}>
-        <span>{item.kind === 'batch' ? 'Batch' : 'Image'} · {item.status === 'queued' ? 'Waiting' : 'Running'}</span>
-        <span>{item.completed.toLocaleString()} / {item.total.toLocaleString()} complete</span>
+      <strong>Detection queue</strong>{activeJobs.map((item) => <div className="queue-item" key={item.id}>
+        <span>{item.kind === 'batch' ? 'Batch' : 'Image'} · {item.status === 'queued' ? 'Waiting' : 'Running'}</span><span>{item.completed.toLocaleString()} / {item.total.toLocaleString()} complete</span>
         <progress value={item.completed} max={item.total || 1} />
       </div>)}
     </section>}
-    {dashboardMetrics && <section className="metrics-dashboard" aria-label="Dataset and evaluation metrics">
-      <div className="metric"><span>Total images</span><strong>{dashboardMetrics.total_images.toLocaleString()}</strong></div>
-      <div className="metric"><span>Verified plates</span><strong>{dashboardMetrics.verified_plates.toLocaleString()}</strong></div>
-      <div className="metric"><span>Images needing review</span><strong>{dashboardMetrics.images_needing_review.toLocaleString()}</strong></div>
-      <div className="metric"><span>OCR exact-match accuracy</span><strong>{dashboardMetrics.ocr_exact_match_accuracy == null ? '—' : `${(dashboardMetrics.ocr_exact_match_accuracy * 100).toFixed(1)}%`}</strong><small>{dashboardMetrics.ocr_evaluated_plates.toLocaleString()} verified OCR labels</small></div>
-      <div className="metric"><span>Character error rate (CER)</span><strong>{dashboardMetrics.character_error_rate == null ? '—' : `${(dashboardMetrics.character_error_rate * 100).toFixed(1)}%`}</strong><small>Lower is better</small></div>
-      <div className="metric"><span>Detection recall</span><strong>{dashboardMetrics.detection_recall == null ? 'No evaluation labels' : `${(dashboardMetrics.detection_recall * 100).toFixed(1)}%`}</strong><small>AI-matched / {dashboardMetrics.detection_evaluated_plates.toLocaleString()} verified plates</small></div>
-      <button className="metrics-refresh" onClick={() => void loadMetrics()} title="Refresh dataset and evaluation metrics">Refresh metrics</button>
-    </section>}
-    <section className="toolbar"><select value={source} onChange={(e) => changeSource(e.target.value as 'rawimages' | 'upload')}><option value="rawimages">Server rawimages</option><option value="upload">Uploads</option></select>
-      {source === 'rawimages' && <button onClick={refresh} disabled={busy}>Refresh images</button>}
+    <section className="toolbar">
+      <button onClick={reloadRegisteredImages} disabled={busy}>Reload images</button>
       <label className="review-filter">Review queue
         <select value={confidenceReview} onChange={(e) => { setFilteringImages(true); setConfidenceReview(e.target.value as typeof confidenceReview); }}>
           <option value="all">All · low confidence first</option><option value="detector">Detector confidence</option><option value="ocr">OCR confidence</option><option value="both">Detector or OCR</option>
@@ -486,7 +585,7 @@ export default function App() {
       </label>
       <label className="review-filter">Status filter
         <select value={statusFilter} onChange={(e) => { setFilteringImages(true); setStatusFilter(e.target.value as typeof statusFilter); }}>
-          <option value="all">All statuses</option><option value="needs_review">Needs review</option><option value="verified">Verified</option><option value="rejected">Rejected</option><option value="no_plate">No plate</option>
+          <option value="all">All statuses</option><option value="needs_review">Needs review</option><option value="reviewed">Reviewed</option><option value="verified">Verified</option><option value="rejected">Rejected</option><option value="no_plate">No plate</option>
         </select>
       </label>
       {confidenceReview !== 'all' && <label className="review-filter">Below
@@ -500,7 +599,7 @@ export default function App() {
         <span className="counter">{images.length ? `${pageOffset + index + 1} / ${imageTotal}` : 'No images'}</span>
         <button aria-label="Next image" title="Next image" onClick={() => move(1)} disabled={!images.length || pageOffset + index >= imageTotal - 1}>→</button>
         {current && <select className={`review-status-action status-${current.review_status}`} aria-label="Set current image review status" title="Set review status" value={current.review_status} onChange={(e) => void setReviewStatus(e.target.value as ReviewStatus)} disabled={busy || dirtyImageId === current.id}>
-          <option value="needs_review">Needs review</option><option value="verified">Verified</option><option value="rejected">Rejected</option><option value="no_plate">No plate</option>
+          <option value="needs_review">Needs review</option><option value="reviewed">Reviewed</option><option value="verified">Verified</option><option value="rejected">Rejected</option><option value="no_plate">No plate</option>
         </select>}
       </div>
       <form className="jump-form" onSubmit={jumpToOrder}>
@@ -508,7 +607,7 @@ export default function App() {
         <input id="jump-order" type="number" min="1" max={imageTotal || 1} value={jumpOrder} onChange={(e) => setJumpOrder(e.target.value)} disabled={!imageTotal || busy} />
         <button type="submit" disabled={!imageTotal || busy}>Go</button>
       </form>
-      <span className="filename">{current?.filename || 'Add images to rawimages/ or upload one'}</span>
+      <span className="filename">{current?.filename || (source === 'datasets_folder' ? 'No images found — click "Sync from datasets/ folder" to scan.' : 'Import images into datasets/raw/')}</span>
       <div className="zoom-controls" aria-label="Image zoom controls">
         <button aria-label="Zoom out" title="Zoom out" onClick={() => setZoom((value) => Math.max(0.25, Math.round((value - 0.25) * 100) / 100))} disabled={zoom <= 0.25}>−</button>
         <span>{Math.round(zoom * 100)}%</span>
@@ -516,7 +615,7 @@ export default function App() {
         <button onClick={() => setZoom(1)} disabled={zoom === 1}>Fit</button>
       </div>
       {current && dirtyImageId === current.id && <span className="verify-badge pending">Unsaved edits</span>}
-      <button className="primary" onClick={() => detect(false)} disabled={busy || jobActive || trainingActive || !current}>Auto detect</button>
+      <button className="primary" onClick={() => detect(false)} disabled={busy || jobActive || anyTrainingActive || !current}>Auto detect</button>
       <button className="primary" onClick={save} disabled={busy || !current}>Save labels</button>
     </section>
     <section className="workspace">
@@ -530,7 +629,7 @@ export default function App() {
             </Fragment>; })}
             {drawing && <Rect x={Math.min(drawing[0],drawing[2])*scale} y={Math.min(drawing[1],drawing[3])*scale} width={Math.abs(drawing[2]-drawing[0])*scale} height={Math.abs(drawing[3]-drawing[1])*scale} stroke="#38bdf8" dash={[5,3]} />}
           </Layer>
-        </Stage> : <div className="empty">{current ? 'Loading image…' : 'No images found. Put images in rawimages/ or upload one.'}</div>}
+        </Stage> : <div className="empty">{current ? 'Loading image…' : (source === 'datasets_folder' ? 'No images loaded. Click "Sync from datasets/ folder" above.' : 'No registered images found. Import a dataset into datasets/raw/ first.')}</div>}
       </div>
       <aside className="side-panel"><h2>Plate annotations <span>{boxes.length}</span></h2><p className="hint">Draw a box on the image. Right-click a box row to remove it.</p>
         <div className="annotation-list">{boxes.map((box, i) => <article className="annotation" key={i} onContextMenu={(e) => { e.preventDefault(); removeBox(i); }}>
@@ -544,5 +643,10 @@ export default function App() {
     </section>
     {message && <div className="status" role="status">{message}</div>}
     <footer>AI boxes are orange; manual boxes are green. OCR guesses are never saved as ground truth automatically. Save label edits before changing review status. Shortcuts: ←/→ or P/N navigate · Ctrl/⌘+S save · V verify · Delete remove selected box · T focus plate text.</footer>
+    </>}
+    {section === 'detector' && renderTrainingSection('detector', detectorTrainingJob)}
+    {section === 'ocr' && renderTrainingSection('ocr', ocrTrainingJob)}
+    {section === 'recognition' && <RecognitionTest />}
+    {message && section !== 'production' && <div className="status" role="status">{message}</div>}
   </main>;
 }

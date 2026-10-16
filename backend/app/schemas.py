@@ -16,15 +16,34 @@ class StartDetection(BaseModel):
     image_id: str
 
 
+class RecognitionRequest(BaseModel):
+    image_id: str
+    detector_job_id: str | None = None
+    ocr_job_id: str | None = None
+
+
+class StartEvaluation(BaseModel):
+    dataset_snapshot_id: str = Field(min_length=32, max_length=32)
+    detector_job_id: str | None = None
+    ocr_job_id: str | None = None
+
+
+class UpdateOcrSample(BaseModel):
+    plate_text: str = Field(default="", max_length=32)
+    status: Literal["pending", "verified", "rejected"] = "pending"
+
+
 class SetVerification(BaseModel):
     verified: bool
 
 
 class SetReviewStatus(BaseModel):
-    status: Literal["needs_review", "verified", "rejected", "no_plate"]
+    status: Literal["needs_review", "reviewed", "verified", "rejected", "no_plate"]
 
 
 class StartTraining(BaseModel):
+    model_type: Literal["detector", "ocr"] = "detector"
+    dataset_snapshot_id: str = Field(min_length=32, max_length=32)
     epochs: int = Field(default=30, ge=1, le=300)
     batch_size: int = Field(default=8, ge=1, le=64)
     image_size: int = Field(default=640, ge=320, le=1280, multiple_of=32)

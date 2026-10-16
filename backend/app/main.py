@@ -1,26 +1,34 @@
 from contextlib import asynccontextmanager
+import csv
+import hashlib
+import math
+import os
 from pathlib import Path
-from threading import Lock, Thread
+from tempfile import NamedTemporaryFile
+from threading import Lock
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
-from sqlalchemy import case, func, select, text
+from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse, Response
+from sqlalchemy import case, func, or_, select, text
 from sqlalchemy.orm import Session, selectinload
 
 from . import models  # noqa: F401 - register ORM metadata
 from .celery_app import celery_app
 from .database import Base, SessionLocal, engine, get_db
-from .logic import annotation_payload, image_payload, import_legacy_records, iou, metrics_payload, sync_raw_images
-from .models import Annotation, DetectionJob, ImageRecord, TrainingJob, utcnow
-from .schemas import SaveAnnotations, SetReviewStatus, SetVerification, StartDetection, StartTraining
-from .storage import RAW_IMAGES_DIR, UPLOADS_DIR, image_path, save_upload
+from .logic import annotation_payload, image_payload, iou, metrics_payload, sync_datasets_folder
+from .models import Annotation, DatasetSnapshot, DatasetManifest, DetectionJob, EvaluationJob, ImageRecord, TrainingJob, utcnow
+from .schemas import RecognitionRequest, SaveAnnotations, SetReviewStatus, SetVerification, StartDetection, StartEvaluation, StartTraining, UpdateOcrSample
+from .storage import DATASETS_DIR, UPLOADS_DIR, image_path, save_upload
 from .tasks import run_detection_job  # noqa: F401 - register Celery task
 from .training import run_training_job
+from .datasets import create_detection_snapshot, tree_sha256
+from .dataset_registry import audit_dataset, create_manifest, report_path
+from .alpr import run_detection
+from .evaluation import run_evaluation_job  # noqa: F401 - register Celery task
 
-_refresh_lock = Lock()
 _batch_queue_lock = Lock()
-_refresh_state = {"running": False, "processed": 0, "total": 0, "added_or_changed": 0, "error": None}
+_ocr_csv_lock = Lock()
 
 
 def _worker_detection_tasks():
@@ -42,24 +50,6 @@ def _worker_detection_tasks():
     return tasks
 
 
-def _run_raw_image_refresh() -> None:
-    with _refresh_lock:
-        _refresh_state.update(running=True, processed=0, total=0, added_or_changed=0, error=None)
-    try:
-        with SessionLocal() as db:
-            def update_progress(processed: int, total: int, changed: int) -> None:
-                with _refresh_lock:
-                    _refresh_state.update(processed=processed, total=total, added_or_changed=changed)
-
-            sync_raw_images(db, batch_size=500, progress_callback=update_progress)
-    except Exception as exc:
-        with _refresh_lock:
-            _refresh_state["error"] = str(exc)
-    finally:
-        with _refresh_lock:
-            _refresh_state["running"] = False
-
-
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     Base.metadata.create_all(bind=engine)
@@ -67,13 +57,81 @@ async def lifespan(_app: FastAPI):
         connection.execute(text("ALTER TABLE images ADD COLUMN IF NOT EXISTS verified_at TIMESTAMPTZ"))
         connection.execute(text("ALTER TABLE images ADD COLUMN IF NOT EXISTS review_status VARCHAR(20) NOT NULL DEFAULT 'needs_review'"))
         connection.execute(text("UPDATE images SET review_status = 'verified' WHERE verified_at IS NOT NULL AND review_status = 'needs_review'"))
-    with SessionLocal() as db:
-        import_legacy_records(db)
-    Thread(target=_run_raw_image_refresh, daemon=True).start()
+        connection.execute(text("ALTER TABLE training_jobs ADD COLUMN IF NOT EXISTS current_batch INTEGER NOT NULL DEFAULT 0"))
+        connection.execute(text("ALTER TABLE training_jobs ADD COLUMN IF NOT EXISTS total_batches INTEGER NOT NULL DEFAULT 0"))
+        connection.execute(text("ALTER TABLE training_jobs ADD COLUMN IF NOT EXISTS current_val INTEGER NOT NULL DEFAULT 0"))
+        connection.execute(text("ALTER TABLE training_jobs ADD COLUMN IF NOT EXISTS total_val INTEGER NOT NULL DEFAULT 0"))
+        connection.execute(text("ALTER TABLE training_jobs ADD COLUMN IF NOT EXISTS current_test INTEGER NOT NULL DEFAULT 0"))
+        connection.execute(text("ALTER TABLE training_jobs ADD COLUMN IF NOT EXISTS total_test INTEGER NOT NULL DEFAULT 0"))
+        connection.execute(text("ALTER TABLE training_jobs ADD COLUMN IF NOT EXISTS cancel_requested BOOLEAN NOT NULL DEFAULT FALSE"))
     yield
 
 
 app = FastAPI(title="PlateLens API", version="1.0.0", lifespan=lifespan)
+
+
+@app.get("/api/models")
+def list_models(db: Session = Depends(get_db)):
+    jobs = db.scalars(select(TrainingJob).where(TrainingJob.status == "completed").order_by(TrainingJob.finished_at.desc())).all()
+    output = []
+    for job in jobs:
+        model_type = (job.config or {}).get("model_type", "detector")
+        if model_type in {"detector", "ocr"} and job.model_path and Path(job.model_path).is_file():
+            output.append({"job_id": job.id, "model_type": model_type, "created_at": job.finished_at, "best_epoch": (job.metrics or {}).get("best_epoch")})
+    return {"models": output}
+
+
+@app.post("/api/recognition")
+def recognize_image(payload: RecognitionRequest, db: Session = Depends(get_db)):
+    import os
+    from time import perf_counter
+
+    image = db.get(ImageRecord, payload.image_id)
+    if not image:
+        raise HTTPException(404, "Image not found")
+    training_dir = Path(os.environ.get("TRAINING_DIR", "/training")).resolve()
+
+    def selected_checkpoint(job_id: str | None, model_type: str) -> str | None:
+        if not job_id:
+            return None
+        job = db.get(TrainingJob, job_id)
+        if not job or job.status != "completed" or (job.config or {}).get("model_type", "detector") != model_type or not job.model_path:
+            raise HTTPException(400, f"Select a completed {model_type} checkpoint.")
+        path = Path(job.model_path).resolve()
+        try:
+            path.relative_to((training_dir / "jobs" / job.id).resolve())
+        except ValueError:
+            raise HTTPException(400, "Selected model path is invalid.") from None
+        if not path.is_file():
+            raise HTTPException(404, "Selected checkpoint file is missing.")
+        return str(path)
+
+    try:
+        path = image_path(image.source, image.original_filename, image.storage_key)
+    except FileNotFoundError:
+        raise HTTPException(404, "Image file not found") from None
+    detector = selected_checkpoint(payload.detector_job_id, "detector")
+    ocr = selected_checkpoint(payload.ocr_job_id, "ocr")
+    started = perf_counter()
+    try:
+        detections = run_detection(path, detector, ocr)
+    except Exception as exc:
+        raise HTTPException(422, f"Recognition failed: {str(exc)[:500]}") from None
+    import base64
+    import cv2
+    frame = cv2.imread(str(path))
+    for detection in detections:
+        x1, y1, x2, y2 = (int(value) for value in detection["bbox_xyxy_pixels"])
+        h, w = frame.shape[:2]
+        x1, x2 = max(0, min(w, x1)), max(0, min(w, x2))
+        y1, y2 = max(0, min(h, y1)), max(0, min(h, y2))
+        if x2 > x1 and y2 > y1:
+            ok, encoded = cv2.imencode(".jpg", frame[y1:y2, x1:x2])
+            if ok:
+                detection["crop_data_url"] = "data:image/jpeg;base64," + base64.b64encode(encoded).decode("ascii")
+    return {"image_id": image.id, "filename": image.original_filename, "width": image.width, "height": image.height, "file_url": f"/api/images/{image.id}/file",
+            "detections": detections, "elapsed_ms": round((perf_counter() - started) * 1000, 1),
+            "detector_job_id": payload.detector_job_id, "ocr_job_id": payload.ocr_job_id}
 
 
 @app.get("/api/health")
@@ -87,9 +145,276 @@ def dashboard_metrics(db: Session = Depends(get_db)):
     return metrics_payload(db)
 
 
+def _snapshot_payload(snapshot: DatasetSnapshot) -> dict:
+    return {"id": snapshot.id, "task": snapshot.task, "split_counts": snapshot.split_counts,
+            "manifest_sha256": snapshot.manifest_sha256, "created_at": snapshot.created_at}
+
+
+@app.get("/api/dataset-snapshots")
+def list_dataset_snapshots(task: str | None = None, db: Session = Depends(get_db)):
+    if task is not None and task not in {"detector", "ocr"}:
+        raise HTTPException(400, "Unsupported dataset task")
+    query = select(DatasetSnapshot).order_by(DatasetSnapshot.created_at.desc())
+    if task:
+        query = query.where(DatasetSnapshot.task == task)
+    return {"snapshots": [_snapshot_payload(row) for row in db.scalars(query).all()]}
+
+
+@app.get("/api/dataset-manifests")
+def list_dataset_manifests(task: str | None = None, db: Session = Depends(get_db)):
+    if task is not None and task not in {"detector", "ocr"}:
+        raise HTTPException(400, "Unsupported dataset task")
+    query = select(DatasetManifest).order_by(DatasetManifest.created_at.desc())
+    if task:
+        query = query.where(DatasetManifest.task == task)
+    return {"manifests": [{"id": row.id, "task": row.task, "version": row.version, "path": row.path,
+                           "manifest_sha256": row.manifest_sha256, "sample_count": row.sample_count, "created_at": row.created_at}
+                          for row in db.scalars(query.limit(100)).all()]}
+
+
+@app.post("/api/dataset-manifests")
+def create_dataset_manifest(task: str):
+    try:
+        payload, path = create_manifest(task, DATASETS_DIR)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    return {"task": task, "version": payload["version"], "path": str(path), "sample_count": len(payload["samples"]),
+            "split_counts": payload["split_counts"], "split_percentages": payload["split_percentages"],
+            "grouping_warning": payload["grouping_warning"]}
+
+
+@app.get("/api/dataset-audit")
+def get_dataset_audit(task: str = "detector"):
+    try:
+        report = audit_dataset(task)
+        path = report_path(DATASETS_DIR, f"audit-{task}", report)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    report["report_path"] = str(path)
+    return report
+
+
+@app.post("/api/dataset-snapshots")
+def create_dataset_snapshot(task: str, db: Session = Depends(get_db)):
+    if task == "detector":
+        try:
+            snapshot = create_detection_snapshot()
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        return _snapshot_payload(snapshot)
+    if task == "ocr":
+        import os
+        from .ocr_training import _collect_crops
+        snapshot_id = uuid4().hex
+        training_dir = Path(os.environ.get("TRAINING_DIR", "/training"))
+        snapshot_path = DATASETS_DIR.resolve() / "snapshots" / "ocr" / snapshot_id
+        try:
+            try:
+                create_manifest("ocr", DATASETS_DIR)
+            except ValueError:
+                # Keep supporting legacy OCR CSV rows that have not been registered yet.
+                pass
+            _collect_crops(snapshot_id, training_dir, output_dir=snapshot_path)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        except Exception as exc:
+            raise HTTPException(400, f"Could not prepare OCR snapshot: {exc}") from None
+        manifest = __import__("json").loads((snapshot_path / "manifest.json").read_text(encoding="utf-8"))
+        snapshot = DatasetSnapshot(id=snapshot_id, task="ocr", path=str(snapshot_path), split_counts=manifest["split_counts"], manifest_sha256=tree_sha256(snapshot_path))
+        db.add(snapshot)
+        db.commit()
+        db.refresh(snapshot)
+        for item in snapshot_path.rglob("*"):
+            if item.is_file():
+                item.chmod(0o444)
+        for item in sorted((path for path in snapshot_path.rglob("*") if path.is_dir()), key=lambda path: len(path.parts), reverse=True):
+            item.chmod(0o555)
+        snapshot_path.chmod(0o555)
+        return _snapshot_payload(snapshot)
+    raise HTTPException(400, "Task must be detector or ocr")
+
+
+def _ocr_sample_rows():
+    root = Path(os.environ.get("RAW_OCR_DATASET_DIR", "/raw-dataset-ocr")).resolve()
+    manifest = root / "annotations.csv"
+    if not manifest.is_file():
+        return root, [], []
+    with manifest.open(newline="", encoding="utf-8-sig") as file:
+        reader = csv.DictReader(file)
+        fields = reader.fieldnames or []
+        if "image_path" not in fields:
+            raise HTTPException(400, "OCR annotation CSV must contain an image_path column.")
+        rows = list(reader)
+    keyed = []
+    for index, row in enumerate(rows):
+        key = f"{index}\0{row.get('image_path', '')}\0{row.get('object_index', '')}"
+        sample_id = hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+        keyed.append((sample_id, row))
+    return root, fields, keyed
+
+
+def _ocr_sample_file(root: Path, row: dict) -> Path:
+    relative = Path(row.get("image_path", ""))
+    if relative.is_absolute() or ".." in relative.parts or relative.suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp", ".bmp"}:
+        raise HTTPException(400, "OCR sample image path is invalid.")
+    path = (root / relative).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError:
+        raise HTTPException(400, "OCR sample image path is outside the configured dataset.") from None
+    if not path.is_file():
+        raise HTTPException(404, "OCR sample image is missing.")
+    return path
+
+
+@app.get("/api/ocr-samples")
+def list_ocr_samples(limit: int = 100, offset: int = 0):
+    root, _fields, rows = _ocr_sample_rows()
+    limit, offset = min(max(limit, 1), 500), max(0, offset)
+    result = []
+    for sample_id, row in rows[offset:offset+limit]:
+        try:
+            source = _ocr_sample_file(root, row)
+        except HTTPException as exc:
+            source = None
+            error = exc.detail
+        else:
+            error = None
+        result.append({"id": sample_id, "filename": Path(row.get("image_path", "")).name,
+                       "file_url": f"/api/ocr-samples/{sample_id}/image", "plate_text": row.get("plate_text", ""),
+                       "verified": str(row.get("verified", "")).strip().lower() in {"1", "true", "yes", "verified"},
+                       "status": row.get("review_status") or ("verified" if str(row.get("verified", "")).strip().lower() in {"1", "true", "yes", "verified"} else "pending"),
+                       "is_crop": str(row.get("is_crop", "")).strip().lower() in {"1", "true", "yes"},
+                       "error": error, "available": source is not None})
+    return {"samples": result, "total": len(rows), "offset": offset, "limit": limit}
+
+
+@app.get("/api/ocr-samples/{sample_id}/image")
+def ocr_sample_image(sample_id: str, margin: float = Query(default=0.08, ge=0, le=0.3)):
+    root, _fields, rows = _ocr_sample_rows()
+    row = next((item for key, item in rows if key == sample_id), None)
+    if row is None:
+        raise HTTPException(404, "OCR sample not found")
+    source = _ocr_sample_file(root, row)
+    if str(row.get("is_crop", "")).strip().lower() in {"1", "true", "yes"}:
+        return FileResponse(source)
+    import cv2
+    image = cv2.imread(str(source))
+    if image is None:
+        raise HTTPException(400, "OCR sample image cannot be decoded.")
+    height, width = image.shape[:2]
+    coords = [str(row.get(key, "")).strip() for key in ("x1", "y1", "x2", "y2")]
+    box = None
+    if all(coords):
+        try:
+            box = tuple(float(value) for value in coords)
+        except ValueError:
+            raise HTTPException(400, "OCR sample crop coordinates are malformed.") from None
+    elif any(coords):
+        raise HTTPException(400, "OCR sample must supply all four crop coordinates.")
+    else:
+        try:
+            parts = list(source.relative_to(root).parts)
+            image_index = next(index for index, part in enumerate(parts) if part.lower() == "images")
+            parts[image_index] = "labels"
+            label_path = root.joinpath(*parts).with_suffix(".txt")
+            lines = label_path.read_text(encoding="utf-8").splitlines()
+            object_index = int(row.get("object_index") or 0)
+        except (OSError, ValueError):
+            lines, object_index = [], 0
+        boxes = []
+        for line in lines:
+            try:
+                values = [float(value) for value in line.split()]
+            except ValueError:
+                continue
+            points = values[1:]
+            if len(points) == 4:
+                cx, cy, bw, bh = points
+                boxes.append(((cx-bw/2)*width, (cy-bh/2)*height, (cx+bw/2)*width, (cy+bh/2)*height))
+            elif len(points) >= 6 and len(points) % 2 == 0:
+                boxes.append((min(points[0::2])*width, min(points[1::2])*height, max(points[0::2])*width, max(points[1::2])*height))
+        if 0 <= object_index < len(boxes):
+            box = boxes[object_index]
+    if box is None:
+        raise HTTPException(400, "No crop coordinates or matching YOLO box were found for this sample.")
+    x1, y1, x2, y2 = box
+    pad_x, pad_y = (x2-x1)*margin, (y2-y1)*margin
+    x1, x2 = max(0, int(x1-pad_x)), min(width, int(x2+pad_x))
+    y1, y2 = max(0, int(y1-pad_y)), min(height, int(y2+pad_y))
+    if x2 <= x1 or y2 <= y1:
+        raise HTTPException(400, "OCR sample crop is empty or outside its image.")
+    ok, encoded = cv2.imencode(".jpg", image[y1:y2, x1:x2])
+    if not ok:
+        raise HTTPException(400, "Could not encode OCR sample crop.")
+    return Response(encoded.tobytes(), media_type="image/jpeg")
+
+
+@app.put("/api/ocr-samples/{sample_id}")
+def update_ocr_sample(sample_id: str, update: UpdateOcrSample):
+    root, fields, rows = _ocr_sample_rows()
+    selected_index = next((index for index, (key, _) in enumerate(rows) if key == sample_id), None)
+    if selected_index is None:
+        raise HTTPException(404, "OCR sample not found")
+    if update.status == "verified" and not update.plate_text:
+        raise HTTPException(400, "Enter the ground-truth plate text before verifying this OCR sample.")
+    with _ocr_csv_lock:
+        root.mkdir(parents=True, exist_ok=True)
+        manifest = root / "annotations.csv"
+        names = list(fields)
+        for name in ("plate_text", "verified", "review_status"):
+            if name not in names:
+                names.append(name)
+        row_values = [dict(row) for _, row in rows]
+        row_values[selected_index]["plate_text"] = update.plate_text
+        row_values[selected_index]["verified"] = "true" if update.status == "verified" else "false"
+        row_values[selected_index]["review_status"] = update.status
+        with NamedTemporaryFile("w", newline="", encoding="utf-8", dir=root, delete=False, suffix=".csv.tmp") as temp:
+            temp_path = Path(temp.name)
+            writer = csv.DictWriter(temp, fieldnames=names, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(row_values)
+        os.replace(temp_path, manifest)
+    return {"id": sample_id, "plate_text": update.plate_text, "status": update.status}
+
+
+def evaluation_payload(job: EvaluationJob) -> dict:
+    return {"id": job.id, "status": job.status, "config": job.config, "processed": job.processed,
+            "total": job.total, "results": job.results, "error": job.error, "created_at": job.created_at,
+            "started_at": job.started_at, "finished_at": job.finished_at}
+
+
+@app.post("/api/evaluations")
+def start_evaluation(payload: StartEvaluation, db: Session = Depends(get_db)):
+    snapshot = db.get(DatasetSnapshot, payload.dataset_snapshot_id)
+    if not snapshot or snapshot.task != "detector":
+        raise HTTPException(400, "Select a detector snapshot with a fixed test split.")
+    active = db.scalar(select(EvaluationJob).where(EvaluationJob.status.in_(["queued", "running"])).limit(1))
+    if active:
+        return evaluation_payload(active)
+    for job_id, model_type in ((payload.detector_job_id, "detector"), (payload.ocr_job_id, "ocr")):
+        if job_id:
+            job = db.get(TrainingJob, job_id)
+            if not job or job.status != "completed" or (job.config or {}).get("model_type", "detector") != model_type:
+                raise HTTPException(400, f"Select a completed {model_type} checkpoint.")
+    job = EvaluationJob(id=uuid4().hex, status="queued", config=payload.model_dump())
+    db.add(job)
+    db.commit()
+    run_evaluation_job.delay(job.id)
+    return evaluation_payload(job)
+
+
+@app.get("/api/evaluations/{job_id}")
+def get_evaluation(job_id: str, db: Session = Depends(get_db)):
+    job = db.get(EvaluationJob, job_id)
+    if not job:
+        raise HTTPException(404, "Evaluation job not found")
+    return evaluation_payload(job)
+
+
 @app.get("/api/images")
 def list_images(
-    source: str = "rawimages",
+    source: str = "registered",
     limit: int = 500,
     offset: int = 0,
     review: str = "all",
@@ -97,11 +422,11 @@ def list_images(
     review_status: str = "all",
     db: Session = Depends(get_db),
 ):
-    if source not in {"rawimages", "upload"}:
+    if source not in {"registered", "upload", "datasets_folder"}:
         raise HTTPException(400, "Unsupported image source")
     if review not in {"all", "detector", "ocr", "both"}:
         raise HTTPException(400, "Unsupported confidence review filter")
-    if review_status not in {"all", "needs_review", "verified", "rejected", "no_plate"}:
+    if review_status not in {"all", "needs_review", "reviewed", "verified", "rejected", "no_plate"}:
         raise HTTPException(400, "Unsupported image review status filter")
     if not 0 <= threshold <= 1:
         raise HTTPException(400, "Confidence threshold must be between 0 and 1")
@@ -159,21 +484,6 @@ def list_images(
     return {"images": [image_payload(item) for item in rows], "total": total, "limit": limit, "offset": offset}
 
 
-@app.post("/api/images/refresh")
-def refresh_images():
-    with _refresh_lock:
-        if not _refresh_state["running"]:
-            _refresh_state.update(running=True, processed=0, total=0, added_or_changed=0, error=None)
-            Thread(target=_run_raw_image_refresh, daemon=True).start()
-        return dict(_refresh_state)
-
-
-@app.get("/api/images/refresh")
-def refresh_status():
-    with _refresh_lock:
-        return dict(_refresh_state)
-
-
 @app.post("/api/images/upload")
 async def upload_image(file: UploadFile = File(...), db: Session = Depends(get_db)):
     filename = Path(file.filename or "image").name[:255]
@@ -181,36 +491,44 @@ async def upload_image(file: UploadFile = File(...), db: Session = Depends(get_d
     suffix = Path(filename).suffix.lower()
     storage_key = f"{image_id}{suffix}"
     path, digest, width, height = await save_upload(file, storage_key)
+    duplicate = db.scalar(select(ImageRecord).where(ImageRecord.source == "upload", ImageRecord.sha256 == digest))
+    if duplicate:
+        path.unlink(missing_ok=True)
+        return image_payload(duplicate)
     image = db.scalar(
         select(ImageRecord).where(ImageRecord.source == "upload", ImageRecord.original_filename == filename)
     )
     if image:
-        old_path = UPLOADS_DIR / Path(image.storage_key).name
-        image.annotations.clear()
-        image.sha256 = digest
-        image.width = width
-        image.height = height
-        image.storage_key = f"uploads/{storage_key}"
-        image.detection_complete = False
-        image.verified_at = None
-        image.review_status = "needs_review"
-        image_id = image.id
-        db.commit()
-        if old_path != path:
-            old_path.unlink(missing_ok=True)
-    else:
-        image = ImageRecord(
-            id=image_id,
-            source="upload",
-            original_filename=filename,
-            sha256=digest,
-            storage_key=f"uploads/{storage_key}",
-            width=width,
-            height=height,
-        )
-        db.add(image)
-        db.commit()
+        stem, extension = Path(filename).stem, Path(filename).suffix
+        filename = f"{stem[:220]}-{image_id[:8]}{extension}"[:255]
+    image = ImageRecord(
+        id=image_id,
+        source="upload",
+        original_filename=filename,
+        sha256=digest,
+        storage_key=f"uploads/{storage_key}",
+        width=width,
+        height=height,
+    )
+    db.add(image)
+    db.commit()
     return image_payload(image)
+
+
+@app.post("/api/images/sync-datasets-folder")
+def sync_datasets_folder_endpoint(db: Session = Depends(get_db)):
+    """Scan datasets/imports/ for images and register them for review.
+
+    Images are registered with source='datasets_folder'. YOLO sidecar label
+    files are imported as unverified annotations. Existing records are updated
+    only when the file hash changes. Returns the count of new/updated images.
+    """
+    try:
+        count = sync_datasets_folder(db)
+    except Exception as exc:
+        raise HTTPException(500, f"Sync failed: {str(exc)[:300]}") from None
+    total = db.scalar(select(func.count()).select_from(ImageRecord).where(ImageRecord.source == "datasets_folder")) or 0
+    return {"synced": count, "total": total}
 
 
 @app.get("/api/images/{image_id}")
@@ -224,7 +542,7 @@ def image_state(image_id: str, db: Session = Depends(get_db)):
         raise HTTPException(404, "Image not found")
     payload = image_payload(image, include_annotations=True)
     payload["annotations"] = [
-        annotation_payload(item) for item in image.annotations if item.ai_detection or item.verified_result
+        annotation_payload(item) for item in image.annotations
     ]
     return payload
 
@@ -294,8 +612,6 @@ def save_annotations(image_id: str, payload: SaveAnnotations, db: Session = Depe
         if matched:
             used_ai.add(candidate[0])
         text_value = item.verified_result.strip()
-        if not text_value:
-            raise HTTPException(400, "Enter the verified plate text; OCR guesses are not saved as ground truth automatically")
         output.append(
             Annotation(
                 image_id=image.id,
@@ -376,11 +692,11 @@ def detect_batch(db: Session = Depends(get_db)):
             }
         images = db.scalars(
             select(ImageRecord)
-            .where(ImageRecord.source == "rawimages")
+            .where(ImageRecord.source.in_(["registered", "datasets_folder"]))
             .order_by(ImageRecord.original_filename.collate("C"))
         ).all()
         if not images:
-            raise HTTPException(400, "No images are available in rawimages/")
+            raise HTTPException(400, "No images are available. Sync the datasets folder or import images first.")
         return queue_job(db, "batch", [item.id for item in images])
 
 
@@ -436,14 +752,34 @@ def job_state(job_id: str, db: Session = Depends(get_db)):
 
 
 def training_payload(job: TrainingJob) -> dict:
+    train_images = int((job.split_counts or {}).get("train", 0))
+    batch_size = int((job.config or {}).get("batch_size", 1))
+    total_batches = max(1, math.ceil(train_images / max(1, batch_size))) if train_images else job.total_batches
+    saved_metrics = dict(job.metrics or {})
+    epoch_history = saved_metrics.pop("epoch_history", [])
+    best_epoch = saved_metrics.pop("best_epoch", None)
+    best_score = saved_metrics.pop("best_score", None)
+    best_metrics = saved_metrics.pop("best_metrics", {})
     return {
         "id": job.id,
         "status": job.status,
+        "model_type": (job.config or {}).get("model_type", "detector"),
         "config": job.config,
         "split_counts": job.split_counts,
         "current_epoch": job.current_epoch,
         "total_epochs": job.total_epochs,
-        "metrics": job.metrics,
+        "current_batch": job.current_batch,
+        "total_batches": total_batches,
+        "current_val": job.current_val,
+        "total_val": job.total_val or int((job.split_counts or {}).get("val", 0)),
+        "current_test": job.current_test,
+        "total_test": job.total_test or int((job.split_counts or {}).get("test", 0)),
+        "cancel_requested": job.cancel_requested,
+        "metrics": saved_metrics,
+        "epoch_history": epoch_history,
+        "best_epoch": best_epoch,
+        "best_score": best_score,
+        "best_metrics": best_metrics,
         "model_ready": bool(job.model_path and Path(job.model_path).is_file()),
         "error": job.error,
         "created_at": job.created_at,
@@ -454,12 +790,17 @@ def training_payload(job: TrainingJob) -> dict:
 
 @app.post("/api/training-jobs")
 def start_training(payload: StartTraining, db: Session = Depends(get_db)):
+    snapshot = db.get(DatasetSnapshot, payload.dataset_snapshot_id)
+    if not snapshot or snapshot.task != payload.model_type:
+        raise HTTPException(400, f"Select an existing {payload.model_type} dataset snapshot before training.")
     existing = db.scalar(
         select(TrainingJob)
         .where(TrainingJob.status.in_(["queued", "running"]))
         .order_by(TrainingJob.created_at.desc())
     )
     if existing:
+        if (existing.config or {}).get("model_type", "detector") != payload.model_type:
+            raise HTTPException(409, f"{(existing.config or {}).get('model_type', 'detector').title()} training is already active.")
         return training_payload(existing)
     detection_tasks = _worker_detection_tasks()
     if detection_tasks:
@@ -492,8 +833,16 @@ def active_training_job(db: Session = Depends(get_db)):
 
 
 @app.get("/api/training-jobs/latest")
-def latest_training_job(db: Session = Depends(get_db)):
-    job = db.scalar(select(TrainingJob).order_by(TrainingJob.created_at.desc()).limit(1))
+def latest_training_job(model_type: str | None = None, db: Session = Depends(get_db)):
+    if model_type is not None and model_type not in {"detector", "ocr"}:
+        raise HTTPException(400, "Unsupported training model type")
+    query = select(TrainingJob).order_by(TrainingJob.created_at.desc())
+    if model_type == "ocr":
+        query = query.where(TrainingJob.config["model_type"].astext == "ocr")
+    elif model_type == "detector":
+        model_field = TrainingJob.config["model_type"].astext
+        query = query.where(or_(model_field == "detector", model_field.is_(None)))
+    job = db.scalar(query.limit(1))
     return {"job": training_payload(job) if job else None}
 
 
@@ -502,6 +851,35 @@ def get_training_job(job_id: str, db: Session = Depends(get_db)):
     job = db.get(TrainingJob, job_id)
     if not job:
         raise HTTPException(404, "Training job not found")
+    return training_payload(job)
+
+
+@app.post("/api/training-jobs/{job_id}/cancel")
+def cancel_training_job(job_id: str, db: Session = Depends(get_db)):
+    job = db.get(TrainingJob, job_id)
+    if not job:
+        raise HTTPException(404, "Training job not found")
+    if job.status not in {"queued", "running"}:
+        raise HTTPException(409, f"Cannot stop a {job.status} training job")
+
+    job.cancel_requested = True
+    if job.status == "queued":
+        job.status = "cancelled"
+        job.finished_at = utcnow()
+    else:
+        try:
+            inspector = celery_app.control.inspect(timeout=1)
+            worker_tasks = (inspector.active() or {}) | (inspector.reserved() or {})
+            task_is_alive = any(
+                any((task.get("args") or [None])[0] == job_id for task in tasks)
+                for tasks in worker_tasks.values()
+            )
+        except Exception:
+            task_is_alive = True
+        if not task_is_alive:
+            job.status = "cancelled"
+            job.finished_at = utcnow()
+    db.commit()
     return training_payload(job)
 
 
@@ -521,9 +899,11 @@ def activate_training_model(job_id: str, db: Session = Depends(get_db)):
         raise HTTPException(400, "Training model path is invalid.") from None
     if not model_path.is_file():
         raise HTTPException(404, "Trained model file not found.")
-    active_path = training_dir / "active.pt"
-    temporary_path = training_dir / "active.pt.tmp"
+    model_type = (job.config or {}).get("model_type", "detector")
+    extension = ".ocr.pt" if model_type == "ocr" else ".pt"
+    active_path = training_dir / ("active_ocr.pt" if model_type == "ocr" else "active.pt")
+    temporary_path = training_dir / f"active{extension}.tmp"
     temporary_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(model_path, temporary_path)
     os.replace(temporary_path, active_path)
-    return {"status": "active", "model": "trained detector", "job_id": job.id}
+    return {"status": "active", "model": f"trained {model_type}", "job_id": job.id}

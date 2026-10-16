@@ -67,27 +67,29 @@ def _edit_distance(first: str, second: str) -> int:
 
 
 def metrics_payload(db: Session) -> dict:
-    total_images = db.scalar(select(func.count()).select_from(ImageRecord)) or 0
+    reviewable = ImageRecord.source.in_(["registered", "datasets_folder"])
+    total_images = db.scalar(select(func.count()).select_from(ImageRecord).where(reviewable)) or 0
     images_needing_review = db.scalar(
-        select(func.count()).select_from(ImageRecord).where(ImageRecord.review_status == "needs_review")
+        select(func.count()).select_from(ImageRecord).where(reviewable, ImageRecord.review_status == "needs_review")
     ) or 0
     verified_plates = db.scalar(
         select(func.count())
         .select_from(Annotation)
         .join(ImageRecord, ImageRecord.id == Annotation.image_id)
-        .where(ImageRecord.review_status == "verified")
+        .where(reviewable, ImageRecord.review_status == "verified")
     ) or 0
     detected_verified_plates = db.scalar(
         select(func.count())
         .select_from(Annotation)
         .join(ImageRecord, ImageRecord.id == Annotation.image_id)
-        .where(ImageRecord.review_status == "verified", Annotation.ai_detection.is_(True))
+        .where(reviewable, ImageRecord.review_status == "verified", Annotation.ai_detection.is_(True))
     ) or 0
     pairs = db.execute(
         select(Annotation.ai_result, Annotation.verified_result)
         .join(ImageRecord, ImageRecord.id == Annotation.image_id)
         .where(
             ImageRecord.review_status == "verified",
+            reviewable,
             Annotation.ai_detection.is_(True),
             Annotation.ai_result.is_not(None),
             Annotation.verified_result.is_not(None),
@@ -118,6 +120,7 @@ def metrics_payload(db: Session) -> dict:
 
 
 def sync_raw_images(db: Session, batch_size: int = 500, progress_callback=None) -> int:
+    from .models import Annotation
     from .storage import IMAGE_EXTENSIONS, RAW_IMAGES_DIR, image_size, sha256_file
 
     if not RAW_IMAGES_DIR.is_dir():
@@ -137,6 +140,7 @@ def sync_raw_images(db: Session, batch_size: int = 500, progress_callback=None) 
             processed += 1
             digest = sha256_file(path)
             image = existing.get(path.name)
+            import_sidecar = image is None or image.sha256 != digest
             try:
                 width, height = image_size(path)
             except Exception:
@@ -167,6 +171,44 @@ def sync_raw_images(db: Session, batch_size: int = 500, progress_callback=None) 
                 image.review_status = "needs_review"
                 image.annotations.clear()
                 count += 1
+            # Optional imported YOLO sidecar. It is treated as an unverified
+            # annotation for review; it never becomes training ground truth until
+            # a user verifies the image in the review interface.
+            label_path = RAW_IMAGES_DIR / "labels" / f"{path.name}.txt"
+            if import_sidecar and label_path.is_file() and not image.annotations:
+                imported = []
+                try:
+                    for line in label_path.read_text(encoding="utf-8").splitlines():
+                        values = [float(value) for value in line.split()]
+                        if len(values) < 5 or int(values[0]) != 0:
+                            continue
+                        coordinates = values[1:]
+                        if len(coordinates) == 4:
+                            cx, cy, bw, bh = coordinates
+                            bounds = [cx-bw/2, cy-bh/2, cx+bw/2, cy+bh/2]
+                        elif len(coordinates) >= 6 and len(coordinates) % 2 == 0:
+                            xs, ys = coordinates[0::2], coordinates[1::2]
+                            bounds = [min(xs), min(ys), max(xs), max(ys)]
+                        else:
+                            continue
+                        x1, y1, x2, y2 = bounds
+                        x1, x2 = max(0, min(1, x1)), max(0, min(1, x2))
+                        y1, y2 = max(0, min(1, y1)), max(0, min(1, y2))
+                        if x2 <= x1 or y2 <= y1:
+                            continue
+                        imported.append(Annotation(
+                            image_id=image.id,
+                            bbox_xyxy_pixels=[x1*width, y1*height, x2*width, y2*height],
+                            bbox_normalized_xywh=[(x1+x2)/2, (y1+y2)/2, x2-x1, y2-y1],
+                            ai_detection=False,
+                            verified_result="",
+                        ))
+                    if imported:
+                        db.add_all(imported)
+                except (OSError, ValueError, OverflowError):
+                    # Keep the image available for manual labeling; malformed
+                    # external labels are not trusted or applied.
+                    pass
         db.commit()
         if progress_callback:
             progress_callback(processed, len(paths), count)
@@ -253,3 +295,124 @@ def import_legacy_records(db: Session) -> int:
                 continue
     db.commit()
     return imported
+
+
+def sync_datasets_folder(db: Session, batch_size: int = 500, progress_callback=None) -> int:
+    """Scan datasets/imports/ for images and register them for review.
+
+    Images are stored with source="datasets_folder" and a storage_key of the
+    form "datasets/imports/<relative-path>".  Existing YOLO sidecar labels
+    (same directory, ``labels/`` sub-tree, or same stem with .txt extension)
+    are imported as unverified annotations so reviewers see pre-drawn boxes.
+    Already-registered entries are updated only when the file hash changes.
+    """
+    from .models import Annotation
+    from .storage import DATASETS_IMPORTS_DIR, IMAGE_EXTENSIONS, image_size, sha256_file
+
+    if not DATASETS_IMPORTS_DIR.is_dir():
+        return 0
+
+    imports_root = DATASETS_IMPORTS_DIR.resolve()
+    image_files = sorted(
+        (p for p in imports_root.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS),
+        key=lambda p: p.as_posix().casefold(),
+    )
+
+    existing = {
+        image.storage_key: image
+        for image in db.scalars(select(ImageRecord).where(ImageRecord.source == "datasets_folder")).all()
+    }
+
+    count = 0
+    processed = 0
+    for start in range(0, len(image_files), batch_size):
+        for path in image_files[start: start + batch_size]:
+            processed += 1
+            relative = path.relative_to(imports_root)
+            storage_key = f"datasets/imports/{relative.as_posix()}"
+            digest = sha256_file(path)
+            image = existing.get(storage_key)
+            import_sidecar = image is None or image.sha256 != digest
+            try:
+                width, height = image_size(path)
+            except Exception:
+                continue
+            if image is None:
+                import uuid
+                image = ImageRecord(
+                    id=uuid.uuid4().hex,
+                    source="datasets_folder",
+                    original_filename=relative.as_posix(),
+                    sha256=digest,
+                    storage_key=storage_key,
+                    width=width,
+                    height=height,
+                )
+                db.add(image)
+                existing[storage_key] = image
+                count += 1
+            elif image.sha256 != digest:
+                image.sha256 = digest
+                image.width = width
+                image.height = height
+                image.detection_complete = False
+                image.verified_at = None
+                image.review_status = "needs_review"
+                image.annotations.clear()
+                count += 1
+
+            # Try to load a matching YOLO sidecar label file.
+            # Supports both flat layouts (labels/<stem>.txt) and nested
+            # layouts (…/images/…/<stem>.ext → …/labels/…/<stem>.txt).
+            if import_sidecar:
+                parts = list(relative.parts)
+                images_idx = next(
+                    (i for i, p in enumerate(parts) if p.lower() == "images"), None
+                )
+                if images_idx is not None:
+                    label_parts = parts[:]
+                    label_parts[images_idx] = "labels"
+                    label_path = imports_root.joinpath(*label_parts).with_suffix(".txt")
+                else:
+                    label_path = path.parent / "labels" / path.with_suffix(".txt").name
+                    if not label_path.is_file():
+                        label_path = path.with_suffix(".txt")
+
+                db.flush()
+                if label_path.is_file() and not image.annotations:
+                    imported_anns = []
+                    try:
+                        for line in label_path.read_text(encoding="utf-8").splitlines():
+                            values = [float(v) for v in line.split()]
+                            if len(values) < 5:
+                                continue
+                            coords = values[1:]
+                            if len(coords) == 4:
+                                cx, cy, bw, bh = coords
+                                bounds = [cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2]
+                            elif len(coords) >= 6 and len(coords) % 2 == 0:
+                                xs, ys = coords[0::2], coords[1::2]
+                                bounds = [min(xs), min(ys), max(xs), max(ys)]
+                            else:
+                                continue
+                            x1, y1, x2, y2 = bounds
+                            x1, x2 = max(0.0, min(1.0, x1)), max(0.0, min(1.0, x2))
+                            y1, y2 = max(0.0, min(1.0, y1)), max(0.0, min(1.0, y2))
+                            if x2 <= x1 or y2 <= y1:
+                                continue
+                            imported_anns.append(Annotation(
+                                image_id=image.id,
+                                bbox_xyxy_pixels=[x1 * width, y1 * height, x2 * width, y2 * height],
+                                bbox_normalized_xywh=[(x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1],
+                                ai_detection=False,
+                                verified_result="",
+                            ))
+                        if imported_anns:
+                            db.add_all(imported_anns)
+                    except (OSError, ValueError, OverflowError):
+                        pass
+
+        db.commit()
+        if progress_callback:
+            progress_callback(processed, len(image_files), count)
+    return count
