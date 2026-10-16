@@ -246,7 +246,7 @@ def run_training_job(job_id: str):
         run_dir.mkdir(parents=True, exist_ok=True)
         global_best = training_dir / "best_detector.pt"
         _seed_checkpoint("detector", global_best)
-        initial_weights = global_best if global_best.is_file() else pretrained_dir / "yolo11n.pt"
+        initial_weights = global_best if global_best.is_file() else pretrained_dir / "yolo26n.pt"
         model = YOLO(str(initial_weights))
 
         def cancellation_requested() -> bool:
