@@ -30,7 +30,7 @@ from .ocr_model import (
 from .storage import DATASETS_DIR, image_path, sha256_file
 from .training import _record_epoch_metrics, _seed_checkpoint, _split_sizes
 from .datasets import tree_sha256
-from .dataset_registry import initial_split
+from .datasets import initial_split
 
 
 class PlateCropDataset(Dataset):

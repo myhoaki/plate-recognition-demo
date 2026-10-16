@@ -6,6 +6,7 @@ python-multipart>=0.0.9,<1
 celery[redis]>=5.4,<6
 paddlepaddle>=3.0,<4
 paddleocr>=3.7.0
+PyYAML>=6.0,<7
 opencv-python==4.11.0.86
 opencv-python-headless==4.11.0.86
 --extra-index-url https://download.pytorch.org/whl/cpu

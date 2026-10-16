@@ -19,13 +19,12 @@ from . import models  # noqa: F401 - register ORM metadata
 from .celery_app import celery_app
 from .database import Base, SessionLocal, engine, get_db
 from .logic import annotation_payload, image_payload, iou, metrics_payload, sync_datasets_folder
-from .models import Annotation, DatasetSnapshot, DatasetManifest, DetectionJob, EvaluationJob, ImageRecord, TrainingJob, utcnow
+from .models import Annotation, DatasetSnapshot, DetectionJob, EvaluationJob, ImageRecord, TrainingJob, utcnow
 from .schemas import ImportSnapshot, RecognitionRequest, SaveAnnotations, SetReviewStatus, SetVerification, StartDetection, StartEvaluation, StartTraining, UpdateOcrSample
 from .storage import DATASETS_DIR, UPLOADS_DIR, image_path, save_upload
 from .tasks import run_detection_job  # noqa: F401 - register Celery task
 from .training import run_training_job
 from .datasets import create_detection_snapshot, tree_sha256
-from .dataset_registry import audit_dataset, create_manifest, report_path
 from .alpr import run_detection
 from .evaluation import run_evaluation_job  # noqa: F401 - register Celery task
 
@@ -175,40 +174,6 @@ def list_dataset_snapshots(task: str | None = None, db: Session = Depends(get_db
     return {"snapshots": [_snapshot_payload(row) for row in db.scalars(query).all()]}
 
 
-@app.get("/api/dataset-manifests")
-def list_dataset_manifests(task: str | None = None, db: Session = Depends(get_db)):
-    if task is not None and task not in {"detector", "ocr"}:
-        raise HTTPException(400, "Unsupported dataset task")
-    query = select(DatasetManifest).order_by(DatasetManifest.created_at.desc())
-    if task:
-        query = query.where(DatasetManifest.task == task)
-    return {"manifests": [{"id": row.id, "task": row.task, "version": row.version, "path": row.path,
-                           "manifest_sha256": row.manifest_sha256, "sample_count": row.sample_count, "created_at": row.created_at}
-                          for row in db.scalars(query.limit(100)).all()]}
-
-
-@app.post("/api/dataset-manifests")
-def create_dataset_manifest(task: str):
-    try:
-        payload, path = create_manifest(task, DATASETS_DIR)
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from None
-    return {"task": task, "version": payload["version"], "path": str(path), "sample_count": len(payload["samples"]),
-            "split_counts": payload["split_counts"], "split_percentages": payload["split_percentages"],
-            "grouping_warning": payload["grouping_warning"]}
-
-
-@app.get("/api/dataset-audit")
-def get_dataset_audit(task: str = "detector"):
-    try:
-        report = audit_dataset(task)
-        path = report_path(DATASETS_DIR, f"audit-{task}", report)
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from None
-    report["report_path"] = str(path)
-    return report
-
-
 @app.post("/api/dataset-snapshots")
 def create_dataset_snapshot(task: str, db: Session = Depends(get_db)):
     if task == "detector":
@@ -224,11 +189,6 @@ def create_dataset_snapshot(task: str, db: Session = Depends(get_db)):
         training_dir = Path(os.environ.get("TRAINING_DIR", "/training"))
         snapshot_path = DATASETS_DIR.resolve() / "snapshots" / "ocr" / snapshot_id
         try:
-            try:
-                create_manifest("ocr", DATASETS_DIR)
-            except ValueError:
-                # Keep supporting legacy OCR CSV rows that have not been registered yet.
-                pass
             _collect_crops(snapshot_id, training_dir, output_dir=snapshot_path)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from None

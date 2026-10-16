@@ -55,7 +55,7 @@ export default function App() {
   const [pageOffset, setPageOffset] = useState(0);
   const [jumpOrder, setJumpOrder] = useState('1');
   const [section, setSection] = useState<AppSection>('production');
-  const [source, setSource] = useState<'registered' | 'datasets_folder'>('datasets_folder');
+  const source = 'datasets_folder' as const;
   const [syncing, setSyncing] = useState(false);
   const [confidenceReview, setConfidenceReview] = useState<'all' | 'detector' | 'ocr' | 'both'>('all');
   const [confidenceThreshold, setConfidenceThreshold] = useState(0.7);
@@ -75,9 +75,6 @@ export default function App() {
   const [snapshots, setSnapshots] = useState<DatasetSnapshot[]>([]);
   const [datasetMetrics, setDatasetMetrics] = useState<DashboardMetrics | null>(null);
   const [selectedSnapshot, setSelectedSnapshot] = useState({ detector: '', ocr: '' });
-  const [importPath, setImportPath] = useState('');
-  const [importTask, setImportTask] = useState<'detector' | 'ocr'>('detector');
-  const [importing, setImporting] = useState(false);
   const [trainingConfig, setTrainingConfig] = useState({ epochs: 30, batch_size: 8, image_size: 640, device: 'auto' });
   const [drawing, setDrawing] = useState<number[] | null>(null);
   const [selectedBoxIndex, setSelectedBoxIndex] = useState<number | null>(null);
@@ -305,13 +302,6 @@ export default function App() {
       await loadImages('datasets_folder', undefined, 0);
     } catch (e) { setMessage((e as Error).message); } finally { setSyncing(false); }
   };
-  const switchSource = async (next: 'registered' | 'datasets_folder') => {
-    if (next === source) return;
-    setSource(next);
-    setPageOffset(0);
-    setIndex(0);
-    setMessage('');
-  };
   const detect = async (batch = false) => {
     if (!batch && !current) return;
     setBusy(true); setMessage(batch ? 'Queueing all images…' : 'Queueing detection…');
@@ -360,20 +350,6 @@ export default function App() {
       setSnapshots(items => items.filter(item => item.id !== snapshot.id));
       setSelectedSnapshot(old => ({ ...old, [snapshot.task]: old[snapshot.task] === snapshot.id ? '' : old[snapshot.task] }));
       setMessage(`${snapshot.task} snapshot deleted.`);
-    } catch (e) { setMessage((e as Error).message); }
-    finally { setBusy(false); }
-  };
-  const importSnapshot = async () => {
-    setBusy(true); setMessage(`Importing ${importTask} snapshot…`);
-    try {
-      const snapshot = await api<DatasetSnapshot>('/api/dataset-snapshots/import', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ task: importTask, path: importPath }),
-      });
-      setSnapshots((items) => [snapshot, ...items]);
-      setSelectedSnapshot((old) => ({ ...old, [importTask]: snapshot.id }));
-      setImportPath('');
-      setMessage(`${importTask} snapshot imported · ${snapshot.split_counts.train} train, ${snapshot.split_counts.val} validation, ${snapshot.split_counts.test} test.`);
     } catch (e) { setMessage((e as Error).message); }
     finally { setBusy(false); }
   };
@@ -586,24 +562,10 @@ export default function App() {
     {section === 'production' && <>
     <div className="production-heading"><div><h2>Verify Datasets</h2><p>Review images and verify plate boxes before creating training snapshots.</p></div>
       <div className="snapshot-actions">
-        <div className="source-tabs" role="tablist" aria-label="Image source">
-          <button role="tab" aria-selected={source === 'datasets_folder'} className={source === 'datasets_folder' ? 'active' : ''} onClick={() => void switchSource('datasets_folder')}>datasets/ folder</button>
-          <button role="tab" aria-selected={source === 'registered'} className={source === 'registered' ? 'active' : ''} onClick={() => void switchSource('registered')}>Registry imports</button>
-        </div>
-        {source === 'datasets_folder' && <button onClick={() => void syncDatasetsFolder()} disabled={busy || syncing}>{syncing ? 'Scanning…' : 'Sync from datasets/ folder'}</button>}
-        <button onClick={() => void createSnapshot('detector')} disabled={busy}>Snapshot verified detector data</button>
-        <button onClick={() => void createSnapshot('ocr')} disabled={busy}>Snapshot verified OCR data</button>
+        <button onClick={() => void syncDatasetsFolder()} disabled={busy || syncing}>{syncing ? 'Scanning…' : 'Sync datasets/imports/'}</button>
+        <button onClick={() => void createSnapshot('detector')} disabled={busy}>Build detector snapshot</button>
+        <button onClick={() => void createSnapshot('ocr')} disabled={busy}>Build OCR snapshot</button>
         <button onClick={() => void detect(true)} disabled={busy || batchActive || anyTrainingActive}>Detect all images</button>
-      </div>
-      <div className="import-snapshot">
-        <label>Import snapshot
-          <select value={importTask} onChange={(e) => setImportTask(e.target.value as 'detector' | 'ocr')}>
-            <option value="detector">Detector</option>
-            <option value="ocr">OCR</option>
-          </select>
-        </label>
-        <input value={importPath} onChange={(e) => setImportPath(e.target.value)} placeholder="Snapshot directory path (e.g. /datasets/snapshots/detector/<id>)" />
-        <button onClick={() => void importSnapshot()} disabled={busy || importing || !importPath}>{importing ? 'Importing…' : 'Import snapshot'}</button>
       </div>
     </div>
     <section className="snapshot-list"><strong>Immutable snapshots</strong>{snapshots.length ? snapshots.map((item) => <span key={item.id}><b>{item.task}</b> · {item.id.slice(0, 8)} · {item.split_counts.train}/{item.split_counts.val}/{item.split_counts.test} train/val/test · {item.manifest_sha256.slice(0, 12)} <button className="delete-snapshot" onClick={() => void deleteSnapshot(item)} title="Delete snapshot">×</button></span>) : <span>No snapshots created yet.</span>}</section>
