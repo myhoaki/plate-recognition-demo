@@ -7,7 +7,7 @@ import numpy as np
 
 
 def crop_plate(frame, bbox_xyxy):
-    """Copy of backend/app/alpr.py:crop_plate for isolated testing."""
+    """Copy of backend/app/pipeline.py:crop_plate for isolated testing."""
     x1, y1, x2, y2 = (int(value) for value in bbox_xyxy)
     h, w = frame.shape[:2]
     x1, x2 = max(0, min(w, x1)), max(0, min(w, x2))

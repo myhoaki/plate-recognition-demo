@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import func, select
 
-from .alpr import run_detection
+from .pipeline import run_detection
 from .celery_app import celery_app
 from .database import SessionLocal
 from .logic import iou

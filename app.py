@@ -18,15 +18,15 @@ import cv2
 import numpy as np
 from flask import Flask, jsonify, redirect, render_template, request, send_file, send_from_directory
 
-# FastALPR has been removed. Detection and recognition now live in backend/app/alpr.py
+# Detection and recognition live in backend/app/pipeline.py
 # (YOLO26 detector + OpenCV crop + PaddleOCR recognizer).
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "backend"))
-from backend.app.alpr import (  # noqa: E402
+from backend.app.pipeline import (  # noqa: E402
     crop_plate,
     detect_plates,
-    get_alpr as _backend_get_alpr,
+    get_models as _backend_get_models,
     recognize_plate_text,
 )
 
@@ -44,9 +44,9 @@ legacy_labels_migrated = False
 
 
 @lru_cache(maxsize=1)
-def get_alpr():
+def get_models():
     """Load YOLO26 detector and PaddleOCR recognizer once and reuse across requests."""
-    return _backend_get_alpr()
+    return _backend_get_models()
 
 
 def confidence_value(value: float | list[float] | None) -> float | None:
@@ -378,7 +378,7 @@ def detect_plates_for_labeling():
         return jsonify(error="That image is too large to process (maximum 40 megapixels)."), 400
 
     try:
-        detector, ocr = get_alpr()
+        detector, ocr = get_models()
         with inference_lock:
             detections = detect_plates(image, detector)
         # Stage C: run PaddleOCR recognition-only on each plate crop.

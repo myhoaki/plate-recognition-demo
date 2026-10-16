@@ -7,7 +7,7 @@ from pathlib import Path
 
 from sqlalchemy import select
 
-from .alpr import configure_ultralytics_paths, run_detection
+from .pipeline import configure_ultralytics_paths, run_detection
 from .celery_app import celery_app
 from .database import SessionLocal
 from .logic import iou

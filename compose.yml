@@ -20,6 +20,11 @@ services:
       DATASETS_DIR: /datasets
       LEGACY_LABELS_DIRS: /legacy-labels:/legacy-volume
       TRAINING_DIR: /training
+      # Keep PaddleOCR/PaddleX caches on the writable training volume. The
+      # default (~/.paddlex) lives under /home/app, which the container process
+      # cannot write when PUID differs from the image's built-in user.
+      PADDLE_PDX_CACHE_HOME: /training/paddlex
+      MPLCONFIGDIR: /training/mpl
       RAW_OCR_DATASET_DIR: /raw-dataset-ocr
       VERIFIED_DETECTOR_DATASET_DIR: /verified-dataset-detector
       VERIFIED_OCR_DATASET_DIR: /verified-dataset-ocr
@@ -58,6 +63,8 @@ services:
       RAW_OCR_DATASET_DIR: /raw-dataset-ocr
       VERIFIED_OCR_DATASET_DIR: /verified-dataset-ocr
       TRAINING_DIR: /training
+      PADDLE_PDX_CACHE_HOME: /training/paddlex
+      MPLCONFIGDIR: /training/mpl
     volumes:
       - ./docker/models:/home/app/.cache
       - ./docker/storage:/data

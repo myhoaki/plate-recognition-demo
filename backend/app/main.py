@@ -25,14 +25,21 @@ from .storage import DATASETS_DIR, UPLOADS_DIR, image_path, save_upload
 from .tasks import run_detection_job  # noqa: F401 - register Celery task
 from .training import run_training_job
 from .datasets import create_detection_snapshot, tree_sha256, verify_snapshot
-from .alpr import run_detection
+from .pipeline import run_detection
 from .evaluation import run_evaluation_job  # noqa: F401 - register Celery task
 
 _batch_queue_lock = Lock()
 _ocr_csv_lock = Lock()
 
+DETECTION_TASK_NAME = "platelens.run_detection_job"
+
 
 def _worker_detection_tasks():
+    """Active or queued *detection* tasks on the worker.
+
+    Filters by task name so that an unrelated task (for example a running
+    training job) is not mistaken for image detection.
+    """
     try:
         inspector = celery_app.control.inspect(timeout=1)
         active = inspector.active()
@@ -45,6 +52,8 @@ def _worker_detection_tasks():
     for state, workers in (("running", active or {}), ("queued", reserved or {})):
         for worker_tasks in workers.values():
             for task in worker_tasks:
+                if task.get("name") != DETECTION_TASK_NAME:
+                    continue
                 args = task.get("args") or []
                 if args and isinstance(args[0], str):
                     tasks.append({"id": args[0], "status": state})
@@ -755,6 +764,25 @@ def active_detection_jobs(db: Session = Depends(get_db)):
             for job in jobs
         ]
     }
+
+
+@app.post("/api/detection-jobs/{job_id}/cancel")
+def cancel_detection_job(job_id: str, db: Session = Depends(get_db)):
+    """Cancel a queued or running detection job.
+
+    The worker checks this status before each image, so a queued job simply
+    never starts. Use this to clear the single-concurrency worker when a queued
+    batch would otherwise block training or evaluation.
+    """
+    job = db.get(DetectionJob, job_id)
+    if not job:
+        raise HTTPException(404, "Detection job not found")
+    if job.status not in {"queued", "running"}:
+        raise HTTPException(409, f"Cannot cancel a {job.status} detection job")
+    job.status = "cancelled"
+    job.finished_at = utcnow()
+    db.commit()
+    return {"id": job.id, "status": job.status}
 
 
 @app.get("/api/jobs/{job_id}")

@@ -261,10 +261,15 @@ def run_training_job(job_id: str):
                 job = db.get(TrainingJob, job_id)
                 return not job or job.status == "cancelled" or job.cancel_requested
 
+        # Progress counter for on_train_batch_end, which receives no batch index.
+        batch_counter = {"n": 0}
+
         def record_train_start(trainer):
+            batch_counter["n"] = 0
             _save_job(job_id, current_batch=0, total_batches=expected_batches)
 
         def record_epoch_start(trainer):
+            batch_counter["n"] = 0
             _save_job(
                 job_id,
                 current_epoch=min(int(trainer.epoch) + 1, config["epochs"]),
@@ -272,8 +277,12 @@ def run_training_job(job_id: str):
             )
 
         def record_batch(trainer):
+            # Ultralytics keeps the batch index in a loop-local variable (`for i,
+            # batch in pbar`) and does not expose it on the trainer, and it does
+            # not pass it to on_train_batch_end. Count the callbacks instead.
+            batch_counter["n"] += 1
             total_batches = expected_batches
-            batch = min(int(getattr(trainer, "batch", 0)) + 1, total_batches)
+            batch = min(batch_counter["n"], total_batches)
             if cancellation_requested():
                 trainer.stop = True
                 return

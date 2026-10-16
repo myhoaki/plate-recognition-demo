@@ -1,11 +1,10 @@
-"""Stage A: YOLO26 plate detection + Stage B: OpenCV plate crop + Stage C: PaddleOCR recognition.
+"""The license-plate recognition pipeline.
 
-This module replaces the previous fast_alpr.ALPR bundled pipeline. Detection and
-recognition are now explicitly separated components with independent configuration.
+Stage A: YOLO26 plate detection -> Stage B: OpenCV plate crop -> Stage C: PaddleOCR
+recognition-only.
 
-Pipeline:
-    full image -> YOLO26 detection (pixel boxes) -> OpenCV crop -> PaddleOCR
-    recognition-only (text + confidence) -> final result.
+Detector and recognizer are independent components with separate configuration,
+checkpoints, and evaluation.
 """
 
 from __future__ import annotations
@@ -14,7 +13,7 @@ from functools import lru_cache
 
 import os
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import cv2
 import numpy as np
@@ -81,6 +80,14 @@ class TrainedYoloDetector:
 
 _ultralytics_root: Path | None = None
 
+# PaddleOCR recognition-only model. PP-OCRv6_tiny_rec is the smallest PP-OCRv6
+# tier and is the fastest option on CPU. It covers Latin script, which covers
+# Vietnamese license plates.
+PADDLE_OCR_MODEL = "PP-OCRv6_tiny_rec"
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from paddleocr import TextRecognition
+
 
 def configure_ultralytics_paths(training_dir: Path | None = None) -> Path:
     """Keep Ultralytics config and implicit run outputs under writable storage."""
@@ -102,30 +109,33 @@ def configure_ultralytics_paths(training_dir: Path | None = None) -> Path:
 
 @lru_cache(maxsize=2)
 def _get_paddle_ocr(
-    rec_model_dir: str | None, model_mtime_ns: int
-) -> PaddleOCR | None:
-    """PaddleOCR recognition-only instance.
+    model_dir: str | None, model_mtime_ns: int
+) -> "TextRecognition | None":
+    """PaddleOCR recognition-only recognizer.
 
-    Returns None if paddleocr is not available (import deferred to avoid
-    crashing the API on startup if paddlex/paddleocr has issues).
+    Uses PaddleOCR's TextRecognition pipeline, which runs *only* the recognizer.
+    That is what this project needs: YOLO26 already supplies the plate box, so
+    PaddleOCR's text-detection and orientation models are redundant work.
+
+    The import is deferred so an unavailable or misconfigured PaddleOCR install
+    cannot stop the API from starting; detection still works without OCR.
     """
     try:
-        from paddleocr import PaddleOCR  # noqa: PLC0415 - lazy import
-    except ImportError:
+        from paddleocr import TextRecognition  # noqa: PLC0415 - lazy import
+    except Exception:
         return None
-    return PaddleOCR(
-        use_det=False,
-        use_cls=False,
-        rec_model_dir=rec_model_dir,
-        lang="en",
-        show_log=False,
-    )
+    try:
+        if model_dir:
+            return TextRecognition(model_dir=model_dir)
+        return TextRecognition(model_name=PADDLE_OCR_MODEL)
+    except Exception:
+        return None
 
 
-def get_alpr(
+def get_models(
     detector_checkpoint: str | None = None,
     ocr_checkpoint: str | None = None,
-) -> tuple[TrainedYoloDetector | None, PaddleOCR | None]:
+) -> tuple[TrainedYoloDetector | None, "TextRecognition | None"]:
     """Return (detector, ocr) instances.
 
     Prefers active checkpoints (active_detector.pt / active_ocr) when present,
@@ -200,29 +210,33 @@ def detect_plates(
 
 
 def recognize_plate_text(
-    crop: np.ndarray | None, ocr: PaddleOCR | None
+    crop: np.ndarray | None, ocr: "TextRecognition | None"
 ) -> OcrResult | None:
     """Stage C: run PaddleOCR recognition-only on a cropped plate image.
 
-    Returns OcrResult(text, confidence) or None if the crop is empty/unreadable.
+    TextRecognition.predict() returns a list of dicts with 'rec_text' and
+    'rec_score'. Returns OcrResult(text, confidence), or None when OCR is
+    unavailable or the crop is empty.
     """
     if crop is None or crop.size == 0 or ocr is None:
         return None
     try:
-        result = ocr.ocr(crop, det=False, cls=False)
+        results = ocr.predict(crop)
     except Exception:
         return None
-    if not result:
+    if not results:
         return OcrResult(text="", confidence=0.0)
-    # paddleocr v3 recognition-only returns [[text, score], ...] or [None]
-    first = result[0] if isinstance(result, list) else result
-    if not first or first is None:
+    first = results[0] if isinstance(results, list) else results
+    if not isinstance(first, dict):
         return OcrResult(text="", confidence=0.0)
-    if isinstance(first, (list, tuple)) and len(first) >= 2:
-        text = str(first[0])
-        score = float(first[1]) if first[1] is not None else 0.0
-        return OcrResult(text=text, confidence=score)
-    return OcrResult(text="", confidence=0.0)
+    text = first.get("rec_text") or first.get("rec_texts") or ""
+    score = first.get("rec_score")
+    if score is None:
+        scores = first.get("rec_scores")
+        score = scores[0] if isinstance(scores, (list, tuple)) and scores else 0.0
+    if isinstance(text, (list, tuple)):
+        text = text[0] if text else ""
+    return OcrResult(text=str(text).strip(), confidence=float(score))
 
 
 def run_detection(
@@ -241,7 +255,7 @@ def run_detection(
     if image is None:
         raise ValueError("Image could not be decoded")
 
-    detector, ocr = get_alpr(detector_checkpoint, ocr_checkpoint)
+    detector, ocr = get_models(detector_checkpoint, ocr_checkpoint)
     if detector is None:
         raise ValueError(
             "No detector model available. Train a YOLO26 detector first "

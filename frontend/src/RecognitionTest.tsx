@@ -70,11 +70,11 @@ export default function RecognitionTest() {
   const metric = (key: string) => typeof evaluation?.results[key] === 'number' ? `${(Number(evaluation.results[key]) * 100).toFixed(1)}%` : 'Unavailable';
   const incorrect = Array.isArray(evaluation?.results.incorrect_examples) ? evaluation.results.incorrect_examples as Array<{ image_id: string; filename: string; ground_truth: string[]; predictions: Array<{ text: string }> }> : [];
   return <section className="recognition-page">
-    <header className="training-page-head"><div><h2>Recognition / Test</h2><p>Run the detector and OCR together on one image, using a selected saved checkpoint or the active/default model.</p></div></header>
+    <header className="training-page-head"><div><h2>Recognition / Test</h2><p>Detection, cropping, and recognition run as separate stages: YOLO26 finds plates, OpenCV crops them, and PaddleOCR reads the characters.</p></div></header>
     <div className="recognition-controls">
       <label>Vehicle image<input type="file" accept="image/jpeg,image/png,image/webp,image/bmp" onChange={(event) => { setFile(event.target.files?.[0] || null); setResult(null); }} /></label>
-      <label>Detector checkpoint<select value={detector} onChange={(event) => setDetector(event.target.value)}><option value="">Active / default detector</option>{detectors.map((model) => <option key={model.job_id} value={model.job_id}>Run {model.job_id.slice(0, 8)} · epoch {model.best_epoch ?? '—'}</option>)}</select></label>
-      <label>OCR checkpoint<select value={ocr} onChange={(event) => setOcr(event.target.value)}><option value="">Active / FastALPR default OCR</option>{ocrModels.map((model) => <option key={model.job_id} value={model.job_id}>Run {model.job_id.slice(0, 8)} · epoch {model.best_epoch ?? '—'}</option>)}</select></label>
+      <label>Detector checkpoint<select value={detector} onChange={(event) => setDetector(event.target.value)}><option value="">Active YOLO26 detector</option>{detectors.map((model) => <option key={model.job_id} value={model.job_id}>Run {model.job_id.slice(0, 8)} · epoch {model.best_epoch ?? '—'}</option>)}</select></label>
+      <label>OCR checkpoint<select value={ocr} onChange={(event) => setOcr(event.target.value)}><option value="">PaddleOCR PP-OCRv6</option>{ocrModels.map((model) => <option key={model.job_id} value={model.job_id}>Run {model.job_id.slice(0, 8)} · epoch {model.best_epoch ?? '—'}</option>)}</select></label>
       <button className="primary" disabled={!file || busy} onClick={() => void run()}>{busy ? 'Recognizing…' : 'Run recognition'}</button>
     </div>
     {message && <p className="recognition-message" role="status">{message}</p>}

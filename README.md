@@ -10,7 +10,7 @@ From this directory, build and start the stack:
 PUID="$(id -u)" PGID="$(id -g)" docker compose up -d --build
 ```
 
-Open `http://SERVER_IP:8000`. The initial FastALPR inference can download model assets, so the server needs network access for first use. Docker Compose uses CPU-only PyTorch; do not start training until the datasets and parameters are ready.
+Open `http://SERVER_IP:8000`. First inference downloads the YOLO26 and PaddleOCR model assets, so the server needs network access for first use. Docker Compose uses CPU-only PyTorch; do not start training until the datasets and parameters are ready.
 
 ## Four sections
 
@@ -19,7 +19,7 @@ Open `http://SERVER_IP:8000`. The initial FastALPR inference can download model 
 - **Train OCR** selects a frozen OCR snapshot. Samples come from verified OCR annotations imported into the registry or verified plate boxes and text saved in the review section. The CRNN trainer reports validation and test exact-string accuracy and CER. Crops from one source image are assigned to one split.
 - **Recognition / Test** uploads one vehicle image, lets you select completed detector/OCR checkpoints, runs the full pipeline, and displays boxes, crops, confidence values, and elapsed time. It can also run a queued batch evaluation against a detector snapshot's fixed test split. Matching uses greedy one-to-one IoU ≥ 0.50. Text comparison trims leading/trailing whitespace and ignores case while preserving all other characters. End-to-end accuracy counts a labeled test image as correct only when all plates match and there are no false detections.
 
-The default detector and OCR are the existing FastALPR models. A blank model selection uses the active trained checkpoint when present, otherwise the FastALPR default. Checkpoint options only include completed training runs.
+Detection uses Ultralytics YOLO26 and character recognition uses PaddleOCR PP-OCRv6, run as separate stages. YOLO26 pretrained on COCO does not detect license plates, so a detector must be trained and activated before recognition returns any boxes; until then the API returns an explanatory error rather than an empty result. A blank model selection uses the active trained checkpoint when present, otherwise the pretrained default. Checkpoint options only include completed training runs.
 
 ## Dataset registry and imports
 

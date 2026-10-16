@@ -1,6 +1,5 @@
 """Run YOLO26 plate detection + PaddleOCR recognition on one still image (CPU-only).
 
-FastALPR has been removed. This script uses:
   Stage A: YOLO26 detector (ultralytics) for plate localization
   Stage B: OpenCV/NumPy crop from the detector bounding box
   Stage C: PaddleOCR recognition-only on the cropped plate
@@ -16,10 +15,10 @@ from pathlib import Path
 import cv2
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "backend"))
-from backend.app.alpr import (  # noqa: E402
+from backend.app.pipeline import (  # noqa: E402
     crop_plate,
     detect_plates,
-    get_alpr,
+    get_models,
     recognize_plate_text,
 )
 
@@ -33,7 +32,7 @@ def parse_args() -> argparse.Namespace:
         "-o",
         "--output",
         type=Path,
-        help="Annotated output image (default: <input>_alpr.png)",
+        help="Annotated output image (default: <input>_yolo26_paddleocr.png)",
     )
     return parser.parse_args()
 
@@ -52,7 +51,7 @@ def main() -> int:
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    detector, ocr = get_alpr()
+    detector, ocr = get_models()
     detections = detect_plates(image, detector)
 
     # Stage B + C: crop each plate and run PaddleOCR recognition-only.

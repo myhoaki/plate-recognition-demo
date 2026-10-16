@@ -18,7 +18,7 @@ import numpy as np
 from pathlib import Path
 
 sys.path.insert(0, "/app")
-from backend.app.alpr import get_alpr, detect_plates, recognize_plate_text, crop_plate
+from backend.app.pipeline import get_models, detect_plates, recognize_plate_text, crop_plate
 
 
 def make_synthetic_plate_image(path):
@@ -43,7 +43,7 @@ def main():
     print(f"Image shape: {image.shape}")
 
     print("\n--- Stage A: YOLO26 detection ---")
-    detector, ocr = get_alpr()
+    detector, ocr = get_models()
     print(f"Detector: {detector}")
     print(f"OCR: {ocr}")
 
