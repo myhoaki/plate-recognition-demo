@@ -971,9 +971,12 @@ def activate_training_model(job_id: str, db: Session = Depends(get_db)):
     if not model_path.is_file():
         raise HTTPException(404, "Trained model file not found.")
     model_type = (job.config or {}).get("model_type", "detector")
-    extension = ".ocr.pt" if model_type == "ocr" else ".pt"
-    active_path = training_dir / ("active_ocr.pt" if model_type == "ocr" else "active.pt")
-    temporary_path = training_dir / f"active{extension}.tmp"
+    if model_type == "ocr":
+        active_path = training_dir / "active_ocr.pt"
+        temporary_path = training_dir / "active_ocr.pt.tmp"
+    else:
+        active_path = training_dir / "active_detector.pt"
+        temporary_path = training_dir / "active_detector.pt.tmp"
     temporary_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(model_path, temporary_path)
     os.replace(temporary_path, active_path)

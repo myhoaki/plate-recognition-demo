@@ -6,7 +6,6 @@ import cv2
 import numpy as np
 import torch
 from torch import nn
-from fast_alpr.alpr import BaseOCR, OcrResult
 
 
 PLATE_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -59,21 +58,3 @@ def decode_greedy(logits: torch.Tensor) -> tuple[str, float]:
         last = index
     confidence = sum(confidences) / len(confidences) if confidences else 0.0
     return "".join(text), confidence
-
-
-class TrainedPlateOCR(BaseOCR):
-    """Adapter for fast-alpr's BaseOCR protocol."""
-
-    def __init__(self, model_path: str):
-        super().__init__()
-        checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
-        self.model = PlateOCRNetwork()
-        self.model.load_state_dict(checkpoint["state_dict"])
-        self.model.eval()
-
-    def predict(self, cropped_plate: np.ndarray):
-        tensor = torch.from_numpy(prepare_plate_crop(cropped_plate)).unsqueeze(0)
-        with torch.inference_mode():
-            logits = self.model(tensor)[0]
-        text, confidence = decode_greedy(logits)
-        return OcrResult(text=text, confidence=confidence)

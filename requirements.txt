@@ -1,4 +1,6 @@
-fast-alpr[onnx]==0.4.0
 opencv-python-headless>=4.10,<5
 Flask>=3.0,<4
 gunicorn>=22,<24
+paddlepaddle>=3.0,<4
+paddleocr>=3.7.0
+ultralytics>=8.4.0

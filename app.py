@@ -17,7 +17,18 @@ from uuid import uuid4
 import cv2
 import numpy as np
 from flask import Flask, jsonify, redirect, render_template, request, send_file, send_from_directory
-from fast_alpr import ALPR
+
+# FastALPR has been removed. Detection and recognition now live in backend/app/alpr.py
+# (YOLO26 detector + OpenCV crop + PaddleOCR recognizer).
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "backend"))
+from backend.app.alpr import (  # noqa: E402
+    crop_plate,
+    detect_plates,
+    get_alpr as _backend_get_alpr,
+    recognize_plate_text,
+)
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024
@@ -33,13 +44,9 @@ legacy_labels_migrated = False
 
 
 @lru_cache(maxsize=1)
-def get_alpr() -> ALPR:
-    """Load model weights once and reuse them across requests."""
-    return ALPR(
-        detector_model="yolo-v9-t-384-license-plate-end2end",
-        ocr_model="cct-xs-v2-global-model",
-        ocr_device="cpu",
-    )
+def get_alpr():
+    """Load YOLO26 detector and PaddleOCR recognizer once and reuse across requests."""
+    return _backend_get_alpr()
 
 
 def confidence_value(value: float | list[float] | None) -> float | None:
@@ -96,7 +103,18 @@ def box_iou(first: list[float], second: list[float]) -> float:
     return intersection / max(1.0, first_area + second_area - intersection)
 
 
-def persist_detection(source_type: str, filename: str, image_bytes: bytes, image: np.ndarray, drawn) -> str:
+def persist_detection(
+    source_type: str,
+    filename: str,
+    image_bytes: bytes,
+    image: np.ndarray,
+    detections: list[dict],
+) -> str:
+    """Persist YOLO26 detections + PaddleOCR results as a label record.
+
+    `detections` is a list of dicts from detect_plates()/recognize_plate_text():
+      {bbox_xyxy_pixels, text, detection_confidence, ocr_confidence, ...}
+    """
     LABELS_DIR.mkdir(parents=True, exist_ok=True)
     image_sha256 = hashlib.sha256(image_bytes).hexdigest()
     with label_save_lock:
@@ -114,16 +132,14 @@ def persist_detection(source_type: str, filename: str, image_bytes: bytes, image
         matched_previous: set[int] = set()
         height, width = image.shape[:2]
         objects = []
-        detections = []
-        for result in drawn.results:
-            box = result.detection.bounding_box
-            bounds = [float(box.x1), float(box.y1), float(box.x2), float(box.y2)]
-            ocr = result.ocr
-            ai_text = ocr.text.strip() if ocr and ocr.text else ""
-            confidence = confidence_value(ocr.confidence) if ocr else None
-            country = getattr(ocr, "region", None) if ocr else None
-            country_confidence = confidence_value(getattr(ocr, "region_confidence", None)) if ocr else None
-            detection_confidence = float(result.detection.confidence)
+        detections_out = []
+        for result in detections:
+            bounds = [float(value) for value in result["bbox_xyxy_pixels"]]
+            ai_text = str(result.get("text") or "").strip()
+            confidence = confidence_value(result.get("ocr_confidence"))
+            country = result.get("country")
+            country_confidence = confidence_value(result.get("country_confidence"))
+            detection_confidence = float(result.get("detection_confidence", 0.0))
             normalized = [
                 round(((bounds[0] + bounds[2]) / 2) / width, 6),
                 round(((bounds[1] + bounds[3]) / 2) / height, 6),
@@ -164,7 +180,7 @@ def persist_detection(source_type: str, filename: str, image_bytes: bytes, image
                 "bbox_normalized_xywh": normalized,
             }
             objects.append(annotation)
-            detections.append(
+            detections_out.append(
                 {
                     "bbox_xyxy_pixels": bounds,
                     "text": ai_text,
@@ -201,7 +217,7 @@ def persist_detection(source_type: str, filename: str, image_bytes: bytes, image
             "created_at": previous.get("created_at", now) if previous else now,
             "updated_at": now,
             "ai_detection_complete": True,
-            "models": {"detector": "yolo-v9-t-384-license-plate-end2end", "ocr": "cct-xs-v2-global-model"},
+            "models": {"detector": "yolo26n", "ocr": "paddleocr-ppocrv6-tiny"},
             "image": {
                 "file": image_filename,
                 "original_filename": filename,
@@ -362,23 +378,16 @@ def detect_plates_for_labeling():
         return jsonify(error="That image is too large to process (maximum 40 megapixels)."), 400
 
     try:
+        detector, ocr = get_alpr()
         with inference_lock:
-            drawn = get_alpr().draw_predictions(image.copy())
-        result_id = persist_detection(source_type, filename, image_bytes, image, drawn)
-        detections = []
-        for item in drawn.results:
-            box = item.detection.bounding_box
-            ocr = item.ocr
-            detections.append(
-                {
-                    "bbox_xyxy_pixels": [float(box.x1), float(box.y1), float(box.x2), float(box.y2)],
-                    "text": ocr.text if ocr and ocr.text else "",
-                    "ocr_confidence": confidence_value(ocr.confidence) if ocr else None,
-                    "detection_confidence": float(item.detection.confidence),
-                    "country": getattr(ocr, "region", None) if ocr else None,
-                    "country_confidence": confidence_value(getattr(ocr, "region_confidence", None)) if ocr else None,
-                }
-            )
+            detections = detect_plates(image, detector)
+        # Stage C: run PaddleOCR recognition-only on each plate crop.
+        for detection in detections:
+            crop = crop_plate(image, detection["bbox_xyxy_pixels"])
+            ocr_result = recognize_plate_text(crop, ocr)
+            detection["text"] = ocr_result.text if ocr_result else ""
+            detection["ocr_confidence"] = ocr_result.confidence if ocr_result else None
+        result_id = persist_detection(source_type, filename, image_bytes, image, detections)
         return jsonify(result_id=result_id, detections=detections), 200
     except Exception:
         app.logger.exception("Labeling image detection or result saving failed")
