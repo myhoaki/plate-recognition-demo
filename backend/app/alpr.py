@@ -128,7 +128,9 @@ def get_alpr(
     """Return (detector, ocr) instances.
 
     Prefers active checkpoints (active_detector.pt / active_ocr) when present,
-    otherwise falls back to defaults (YOLO26n pretrained / PP-OCRv6 pretrained).
+    otherwise uses the provided checkpoint paths. If no detector checkpoint is
+    available, detector is None and callers must handle that (YOLO26 pretrained
+    on COCO does not detect license plates — training is required).
     """
     training_dir = Path(os.environ.get("TRAINING_DIR", "/training"))
     active_detector_path = training_dir / "active_detector.pt"
@@ -239,6 +241,12 @@ def run_detection(
         raise ValueError("Image could not be decoded")
 
     detector, ocr = get_alpr(detector_checkpoint, ocr_checkpoint)
+    if detector is None:
+        raise ValueError(
+            "No detector model available. Train a YOLO26 detector first "
+            "(Train Detection section), then activate it, or select a "
+            "completed detector checkpoint in Recognition / Test."
+        )
     detections = detect_plates(image, detector)
 
     output = []
