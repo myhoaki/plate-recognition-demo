@@ -304,8 +304,15 @@ def create_detection_snapshot() -> DatasetSnapshot:
                     }
                 )
 
+        # Ultralytics resolves a relative `path:` against the process working
+        # directory, not this file's location, so write an absolute path.
         (destination / "data.yaml").write_text(
-            "path: .\ntrain: images/train\nval: images/val\ntest: images/test\nnames:\n  0: license_plate\n",
+            f"path: {destination}\n"
+            "train: images/train\n"
+            "val: images/val\n"
+            "test: images/test\n"
+            "names:\n"
+            "  0: license_plate\n",
             encoding="utf-8",
         )
         payload = {

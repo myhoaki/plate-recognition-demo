@@ -230,6 +230,10 @@ def run_training_job(job_id: str):
         config_dir.mkdir(parents=True, exist_ok=True)
         pretrained_dir.mkdir(parents=True, exist_ok=True)
         os.environ["YOLO_CONFIG_DIR"] = str(config_dir)
+        # Keep matplotlib and any other library cache inside the writable
+        # training volume; HOME may belong to a different uid than this process.
+        os.environ.setdefault("MPLCONFIGDIR", str(config_dir / "mpl"))
+        Path(os.environ["MPLCONFIGDIR"]).mkdir(parents=True, exist_ok=True)
 
         from ultralytics import YOLO
 
@@ -382,6 +386,7 @@ def run_training_job(job_id: str):
             project=str(run_dir),
             name="test",
             exist_ok=True,
+            plots=False,
         )
         if cancellation_requested():
             _save_job(job_id, status="cancelled", finished_at=datetime.now(timezone.utc))
