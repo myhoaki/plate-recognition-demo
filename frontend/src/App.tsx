@@ -75,6 +75,9 @@ export default function App() {
   const [snapshots, setSnapshots] = useState<DatasetSnapshot[]>([]);
   const [datasetMetrics, setDatasetMetrics] = useState<DashboardMetrics | null>(null);
   const [selectedSnapshot, setSelectedSnapshot] = useState({ detector: '', ocr: '' });
+  const [importPath, setImportPath] = useState('');
+  const [importTask, setImportTask] = useState<'detector' | 'ocr'>('detector');
+  const [importing, setImporting] = useState(false);
   const [trainingConfig, setTrainingConfig] = useState({ epochs: 30, batch_size: 8, image_size: 640, device: 'auto' });
   const [drawing, setDrawing] = useState<number[] | null>(null);
   const [selectedBoxIndex, setSelectedBoxIndex] = useState<number | null>(null);
@@ -349,6 +352,31 @@ export default function App() {
     } catch (e) { setMessage((e as Error).message); }
     finally { setBusy(false); }
   };
+  const deleteSnapshot = async (snapshot: DatasetSnapshot) => {
+    if (!window.confirm(`Delete snapshot ${snapshot.id.slice(0, 8)} (${snapshot.task})? This removes its files and cannot be undone.`)) return;
+    setBusy(true); setMessage(`Deleting ${snapshot.task} snapshot…`);
+    try {
+      await api(`/api/dataset-snapshots/${snapshot.id}`, { method: 'DELETE' });
+      setSnapshots(items => items.filter(item => item.id !== snapshot.id));
+      setSelectedSnapshot(old => ({ ...old, [snapshot.task]: old[snapshot.task] === snapshot.id ? '' : old[snapshot.task] }));
+      setMessage(`${snapshot.task} snapshot deleted.`);
+    } catch (e) { setMessage((e as Error).message); }
+    finally { setBusy(false); }
+  };
+  const importSnapshot = async () => {
+    setBusy(true); setMessage(`Importing ${importTask} snapshot…`);
+    try {
+      const snapshot = await api<DatasetSnapshot>('/api/dataset-snapshots/import', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ task: importTask, path: importPath }),
+      });
+      setSnapshots((items) => [snapshot, ...items]);
+      setSelectedSnapshot((old) => ({ ...old, [importTask]: snapshot.id }));
+      setImportPath('');
+      setMessage(`${importTask} snapshot imported · ${snapshot.split_counts.train} train, ${snapshot.split_counts.val} validation, ${snapshot.split_counts.test} test.`);
+    } catch (e) { setMessage((e as Error).message); }
+    finally { setBusy(false); }
+  };
   const activateModel = async (target: TrainingJob) => {
     setBusy(true);
     try {
@@ -567,8 +595,18 @@ export default function App() {
         <button onClick={() => void createSnapshot('ocr')} disabled={busy}>Snapshot verified OCR data</button>
         <button onClick={() => void detect(true)} disabled={busy || batchActive || anyTrainingActive}>Detect all images</button>
       </div>
+      <div className="import-snapshot">
+        <label>Import snapshot
+          <select value={importTask} onChange={(e) => setImportTask(e.target.value as 'detector' | 'ocr')}>
+            <option value="detector">Detector</option>
+            <option value="ocr">OCR</option>
+          </select>
+        </label>
+        <input value={importPath} onChange={(e) => setImportPath(e.target.value)} placeholder="Snapshot directory path (e.g. /datasets/snapshots/detector/<id>)" />
+        <button onClick={() => void importSnapshot()} disabled={busy || importing || !importPath}>{importing ? 'Importing…' : 'Import snapshot'}</button>
+      </div>
     </div>
-    <section className="snapshot-list"><strong>Immutable snapshots</strong>{snapshots.length ? snapshots.map((item) => <span key={item.id}><b>{item.task}</b> · {item.id.slice(0, 8)} · {item.split_counts.train}/{item.split_counts.val}/{item.split_counts.test} train/val/test · {item.manifest_sha256.slice(0, 12)}</span>) : <span>No snapshots created yet.</span>}</section>
+    <section className="snapshot-list"><strong>Immutable snapshots</strong>{snapshots.length ? snapshots.map((item) => <span key={item.id}><b>{item.task}</b> · {item.id.slice(0, 8)} · {item.split_counts.train}/{item.split_counts.val}/{item.split_counts.test} train/val/test · {item.manifest_sha256.slice(0, 12)} <button className="delete-snapshot" onClick={() => void deleteSnapshot(item)} title="Delete snapshot">×</button></span>) : <span>No snapshots created yet.</span>}</section>
     {datasetMetrics && <section className="metrics-dashboard dataset-dashboard"><div className="metric"><span>Total images</span><strong>{datasetMetrics.total_images.toLocaleString()}</strong></div><div className="metric"><span>Verified plates</span><strong>{datasetMetrics.verified_plates.toLocaleString()}</strong></div><div className="metric"><span>Needs review</span><strong>{datasetMetrics.images_needing_review.toLocaleString()}</strong></div><div className="metric"><span>OCR exact match</span><strong>{percent(datasetMetrics.ocr_exact_match_accuracy)}</strong></div><div className="metric"><span>Character error rate</span><strong>{percent(datasetMetrics.character_error_rate)}</strong></div><div className="metric"><span>Detection recall</span><strong>{percent(datasetMetrics.detection_recall)}</strong></div><button className="metrics-refresh" onClick={() => void refreshDatasetMetrics()} disabled={busy}>Refresh statistics</button></section>}
     {activeJobs.length > 0 && <section className="queue-status" aria-live="polite">
       <strong>Detection queue</strong>{activeJobs.map((item) => <div className="queue-item" key={item.id}>

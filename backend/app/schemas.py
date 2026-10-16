@@ -57,3 +57,8 @@ class StartTraining(BaseModel):
         if abs(self.train_ratio + self.validation_ratio + self.test_ratio - 1.0) > 0.001:
             raise ValueError("Train, validation, and test ratios must add up to 1.")
         return self
+
+
+class ImportSnapshot(BaseModel):
+    task: Literal["detector", "ocr"]
+    path: str

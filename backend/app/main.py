@@ -3,9 +3,11 @@ import csv
 import hashlib
 import math
 import os
+import shutil
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from threading import Lock
+from typing import Literal
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
@@ -18,7 +20,7 @@ from .celery_app import celery_app
 from .database import Base, SessionLocal, engine, get_db
 from .logic import annotation_payload, image_payload, iou, metrics_payload, sync_datasets_folder
 from .models import Annotation, DatasetSnapshot, DatasetManifest, DetectionJob, EvaluationJob, ImageRecord, TrainingJob, utcnow
-from .schemas import RecognitionRequest, SaveAnnotations, SetReviewStatus, SetVerification, StartDetection, StartEvaluation, StartTraining, UpdateOcrSample
+from .schemas import ImportSnapshot, RecognitionRequest, SaveAnnotations, SetReviewStatus, SetVerification, StartDetection, StartEvaluation, StartTraining, UpdateOcrSample
 from .storage import DATASETS_DIR, UPLOADS_DIR, image_path, save_upload
 from .tasks import run_detection_job  # noqa: F401 - register Celery task
 from .training import run_training_job
@@ -150,6 +152,19 @@ def _snapshot_payload(snapshot: DatasetSnapshot) -> dict:
             "manifest_sha256": snapshot.manifest_sha256, "created_at": snapshot.created_at}
 
 
+def _remove_readonly_tree(path: Path) -> None:
+    """Remove a directory tree whose files/dirs were made read-only (0o444/0o555)."""
+
+    def on_error(func, p, _exc_info):
+        try:
+            os.chmod(p, 0o777)
+        except OSError:
+            pass
+        func(p)
+
+    shutil.rmtree(path, onerror=on_error)
+
+
 @app.get("/api/dataset-snapshots")
 def list_dataset_snapshots(task: str | None = None, db: Session = Depends(get_db)):
     if task is not None and task not in {"detector", "ocr"}:
@@ -232,6 +247,62 @@ def create_dataset_snapshot(task: str, db: Session = Depends(get_db)):
         snapshot_path.chmod(0o555)
         return _snapshot_payload(snapshot)
     raise HTTPException(400, "Task must be detector or ocr")
+
+
+@app.delete("/api/dataset-snapshots/{snapshot_id}")
+def delete_dataset_snapshot(snapshot_id: str, db: Session = Depends(get_db)):
+    snapshot = db.get(DatasetSnapshot, snapshot_id)
+    if not snapshot:
+        raise HTTPException(404, "Snapshot not found")
+    # Refuse to delete a snapshot referenced by a queued/running training or
+    # evaluation job so an in-flight run cannot lose its dataset mid-training.
+    for job in db.scalars(select(TrainingJob).where(TrainingJob.status.in_(["queued", "running"]))).all():
+        if (job.config or {}).get("dataset_snapshot_id") == snapshot_id:
+            raise HTTPException(409, f"Snapshot is used by an active {job.model_type} training job; finish or cancel it first.")
+    for job in db.scalars(select(EvaluationJob).where(EvaluationJob.status.in_(["queued", "running"]))).all():
+        if (job.config or {}).get("dataset_snapshot_id") == snapshot_id:
+            raise HTTPException(409, "Snapshot is used by an active batch evaluation; wait for it to finish first.")
+    snapshot_path = Path(snapshot.path).resolve()
+    try:
+        _remove_readonly_tree(snapshot_path)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise HTTPException(500, f"Could not remove snapshot files: {exc}") from None
+    db.delete(snapshot)
+    db.commit()
+    return {"id": snapshot_id, "deleted": True}
+
+
+@app.post("/api/dataset-snapshots/import")
+def import_dataset_snapshot(payload: ImportSnapshot, db: Session = Depends(get_db)):
+    if payload.task not in {"detector", "ocr"}:
+        raise HTTPException(400, "Task must be detector or ocr")
+    snapshot_path = Path(payload.path).resolve()
+    if not snapshot_path.is_dir():
+        raise HTTPException(400, f"Snapshot directory not found: {payload.path}")
+    manifest_path = snapshot_path / "manifest.json"
+    if not manifest_path.is_file():
+        raise HTTPException(400, "Snapshot directory is missing manifest.json")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, f"Invalid snapshot manifest: {exc}") from None
+    if manifest.get("task") != payload.task:
+        raise HTTPException(400, f"Snapshot task is {manifest.get('task')}, expected {payload.task}")
+    split_counts = manifest.get("split_counts")
+    if not isinstance(split_counts, dict):
+        raise HTTPException(400, "Snapshot manifest is missing split_counts")
+    existing = db.scalar(select(DatasetSnapshot).where(DatasetSnapshot.path == str(snapshot_path)))
+    if existing:
+        raise HTTPException(409, f"Snapshot {existing.id} already registered for this directory.")
+    snapshot_id = uuid4().hex
+    snapshot = DatasetSnapshot(id=snapshot_id, task=payload.task, path=str(snapshot_path),
+                               split_counts=split_counts, manifest_sha256=tree_sha256(snapshot_path))
+    db.add(snapshot)
+    db.commit()
+    db.refresh(snapshot)
+    return _snapshot_payload(snapshot)
 
 
 def _ocr_sample_rows():
