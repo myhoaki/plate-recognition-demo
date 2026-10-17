@@ -5,6 +5,7 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
+import cv2
 from sqlalchemy import select
 
 from .pipeline import configure_ultralytics_paths, run_detection
@@ -32,6 +33,53 @@ def _edit_distance(first: str, second: str) -> int:
             current.append(min(current[-1] + 1, previous[column] + 1, previous[column - 1] + (left != right)))
         previous = current
     return previous[-1]
+
+
+def _image_size(path: Path) -> tuple[int, int]:
+    """Return (height, width) of a snapshot image.
+
+    Detection snapshot manifests carry normalized boxes only, so the pixel size
+    needed to map predictions back into the manifest's normalized space has to
+    be read from the image file itself.
+    """
+    image = cv2.imread(str(path))
+    if image is None:
+        raise ValueError(f"Test image {path.name} could not be decoded.")
+    height, width = image.shape[:2]
+    if width <= 0 or height <= 0:
+        raise ValueError(f"Test image {path.name} has no usable dimensions.")
+    return height, width
+
+
+def _normalized_xyxy(box) -> list[float] | None:
+    """Convert one manifest ground-truth box into normalized xyxy.
+
+    Detection snapshot manifests store boxes as YOLO rows, i.e. a list of four
+    normalized floats ``[cx, cy, w, h]``. The former verified-dataset manifests
+    used dicts carrying ``bbox_normalized_xywh`` instead, so both are accepted.
+    Returns None when the entry cannot be read as a box.
+    """
+    values = box.get("bbox_normalized_xywh") if isinstance(box, dict) else box
+    if not isinstance(values, (list, tuple)) or len(values) != 4:
+        return None
+    try:
+        cx, cy, width, height = (float(value) for value in values)
+    except (TypeError, ValueError):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return [cx - width / 2, cy - height / 2, cx + width / 2, cy + height / 2]
+
+
+def _ground_truth_text(box) -> str:
+    """Return the verified plate text of a manifest box, when it carries any.
+
+    YOLO label files hold geometry only, so snapshot boxes normally have no
+    text. Older verified-dataset manifests carried the human-verified string.
+    """
+    if not isinstance(box, dict):
+        return ""
+    return str(box.get("text") or "").strip().upper()
 
 
 def _checkpoint(job_id: str | None, model_type: str, training_dir: Path) -> str | None:
@@ -96,6 +144,10 @@ def run_evaluation_job(job_id: str):
             configure_ultralytics_paths(training_dir)
         true_positive = false_positive = false_negative = exact = char_errors = char_count = ocr_count = 0
         end_to_end_correct = end_to_end_total = 0
+        # YOLO label files hold geometry only. Text metrics are only meaningful
+        # when the manifest carries verified plate text for every box.
+        snapshot_boxes = [box for row in samples for box in (row.get("boxes") or [])]
+        text_ground_truth = bool(snapshot_boxes) and all(_ground_truth_text(box) for box in snapshot_boxes)
         examples = []
         for index, sample in enumerate(samples, 1):
             relative = Path(sample["image_path"])
@@ -110,10 +162,13 @@ def run_evaluation_job(job_id: str):
                 raise ValueError(f"Test image {relative.name} is missing from the snapshot.")
             if sha256_file(image_path) != sample["sha256"]:
                 raise ValueError(f"Test image {relative.name} changed after the snapshot was created.")
+            height, width = _image_size(image_path)
             truth = []
-            for box in sample.get("boxes", []):
-                x, y, w, h = box["bbox_normalized_xywh"]
-                truth.append(([x-w/2, y-h/2, x+w/2, y+h/2], str(box.get("text", "")).strip().upper()))
+            for box in sample.get("boxes") or []:
+                geometry = _normalized_xyxy(box)
+                if geometry is None:
+                    continue
+                truth.append((geometry, _ground_truth_text(box)))
             try:
                 predictions = run_detection(image_path, detector_path, ocr_path)
             except Exception as exc:
@@ -122,7 +177,7 @@ def run_evaluation_job(job_id: str):
             for gt_index, (gt_box, gt_text) in enumerate(truth):
                 for pred_index, pred in enumerate(predictions):
                     x1, y1, x2, y2 = pred["bbox_xyxy_pixels"]
-                    pred_box = [x1/sample["width"], y1/sample["height"], x2/sample["width"], y2/sample["height"]]
+                    pred_box = [x1/width, y1/height, x2/width, y2/height]
                     candidates.append((iou(gt_box, pred_box), gt_index, pred_index))
             matched_gt, matched_pred = set(), set()
             matches = []
@@ -142,12 +197,16 @@ def run_evaluation_job(job_id: str):
                     char_errors += _edit_distance(predicted, expected)
                     char_count += len(expected)
                     is_correct = is_correct and predicted == expected
-            is_correct = is_correct and fn == 0 and fp == 0 and all(text for _, text in truth)
+            is_correct = is_correct and fn == 0 and fp == 0
+            if text_ground_truth:
+                # Only score the OCR half when the snapshot actually stores
+                # verified text; an absent text label is not a wrong reading.
+                is_correct = is_correct and all(text for _, text in truth)
             if truth:
                 end_to_end_total += 1
                 end_to_end_correct += is_correct
             if not is_correct and len(examples) < 500:
-                examples.append({"image_id": sample["image_id"], "filename": relative.name, "missed_plates": fn, "false_detections": fp,
+                examples.append({"sample_id": sample.get("sample_id", relative.name), "filename": relative.name, "missed_plates": fn, "false_detections": fp,
                                  "ground_truth": [text for _, text in truth], "predictions": [{"text": item.get("text", ""), "bbox_xyxy_pixels": item["bbox_xyxy_pixels"], "detection_confidence": item.get("detection_confidence"), "ocr_confidence": item.get("ocr_confidence")} for item in predictions]})
             _save(job_id, processed=index)
         ground_truth_plates = true_positive + false_negative
@@ -163,15 +222,22 @@ def run_evaluation_job(job_id: str):
                 map_metrics["detection_map_error"] = str(exc)[:300]
         results = {
             "matching_policy": "Greedy one-to-one matching by descending IoU at 0.50; plate text is trimmed and compared case-insensitively, with all other characters preserved.",
+            "text_ground_truth": text_ground_truth,
             "detection_precision": true_positive / max(1, true_positive + false_positive),
             "detection_recall": true_positive / max(1, ground_truth_plates), **map_metrics,
             "true_positives": true_positive, "false_detections": false_positive, "missed_plates": false_negative,
-            "ocr_exact_accuracy": exact / max(1, ocr_count), "ocr_evaluated_plates": ocr_count,
-            "character_error_rate": char_errors / max(1, char_count),
-            "end_to_end_accuracy": end_to_end_correct / max(1, end_to_end_total),
+            "ocr_exact_accuracy": exact / ocr_count if ocr_count else None, "ocr_evaluated_plates": ocr_count,
+            "character_error_rate": char_errors / char_count if char_count else None,
+            "end_to_end_accuracy": end_to_end_correct / end_to_end_total if end_to_end_total else None,
             "end_to_end_evaluated_images": end_to_end_total,
             "incorrect_examples": examples,
         }
+        if not text_ground_truth:
+            results["notes"] = (
+                "This detector snapshot stores YOLO geometry only, so no verified plate text "
+                "exists to compare OCR against. OCR exact string and character error rate are "
+                "unavailable and end-to-end accuracy scores detection only."
+            )
         _save(job_id, results=results, status="completed", finished_at=datetime.now(timezone.utc))
     except Exception as exc:
         _save(job_id, status="failed", error=str(exc)[:2000], finished_at=datetime.now(timezone.utc))
