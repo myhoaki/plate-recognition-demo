@@ -3,6 +3,9 @@ import { Circle, Image as KImage, Layer, Rect, Stage, Text } from 'react-konva';
 import type Konva from 'konva';
 import RecognitionTest from './RecognitionTest';
 import OCRDatasetReview from './OCRDatasetReview';
+import OCRTextReview from './OCRTextReview';
+import AllSamples from './AllSamples';
+import PlateCrop from './PlateCrop';
 
 type Annotation = {
   id?: number; bbox_xyxy_pixels: number[]; ai_detection: boolean; ai_result?: string | null;
@@ -30,24 +33,6 @@ const api = async <T,>(url: string, options?: RequestInit): Promise<T> => {
 };
 const percent = (v?: number | null) => v == null ? '—' : `${(v * 100).toFixed(1)}%`;
 
-function PlateCrop({ image, box }: { image: HTMLImageElement | null; box: number[] }) {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    const [rawX1, rawY1, rawX2, rawY2] = box;
-    if (!canvas || !image || box.length < 4) return;
-    const x1 = Math.max(0, Math.floor(Math.min(rawX1, rawX2)));
-    const y1 = Math.max(0, Math.floor(Math.min(rawY1, rawY2)));
-    const x2 = Math.min(image.naturalWidth, Math.ceil(Math.max(rawX1, rawX2)));
-    const y2 = Math.min(image.naturalHeight, Math.ceil(Math.max(rawY1, rawY2)));
-    if (x2 <= x1 || y2 <= y1) return;
-    canvas.width = x2 - x1;
-    canvas.height = y2 - y1;
-    canvas.getContext('2d')?.drawImage(image, x1, y1, x2 - x1, y2 - y1, 0, 0, canvas.width, canvas.height);
-  }, [image, box]);
-  return <canvas className="plate-crop" ref={canvasRef} aria-label="Cropped plate image" />;
-}
-
 export default function App() {
   const [images, setImages] = useState<ImageRecord[]>([]);
   const [index, setIndex] = useState(0);
@@ -55,6 +40,7 @@ export default function App() {
   const [pageOffset, setPageOffset] = useState(0);
   const [jumpOrder, setJumpOrder] = useState('1');
   const [section, setSection] = useState<AppSection>('production');
+const [verifyView, setVerifyView] = useState<'detection' | 'ocr' | 'samples'>('detection');
   const source = 'datasets_folder' as const;
   const [syncing, setSyncing] = useState(false);
   const [confidenceReview, setConfidenceReview] = useState<'all' | 'detector' | 'ocr' | 'both'>('all');
@@ -183,6 +169,13 @@ export default function App() {
     const nextIndex = preferredId ? data.images.findIndex((item) => item.id === preferredId) : -1;
     setIndex(nextIndex >= 0 ? nextIndex : 0);
   }, [source, confidenceReview, confidenceThreshold, statusFilter]);
+
+  const openImageInDetection = async (imageId: string) => {
+    try {
+      await loadImages(source, imageId, pageOffset);
+      setSelectedBoxIndex(null);
+    } catch (e) { setMessage((e as Error).message); }
+  };
 
   useEffect(() => {
     if (!job?.id || (job.status !== 'queued' && job.status !== 'running')) return;
@@ -493,7 +486,8 @@ export default function App() {
       <header className="training-page-head">
         <div><h2>{isOcr ? 'OCR training' : 'Detection training'}</h2>
           <p>{isOcr ? 'Train character recognition from cropped license plates.' : 'Train plate localization: find the plate position in each image.'}</p></div>
-        {trained?.model_ready && <button onClick={() => void activateModel(trained)} disabled={busy}>Activate {isOcr ? 'OCR' : 'detector'} model</button>}
+        {trained?.model_ready && !isOcr && <button onClick={() => void activateModel(trained)} disabled={busy}>Activate detector model</button>}
+        {trained?.model_ready && isOcr && <span className="training-source-note">Not activatable: this CRNN checkpoint cannot be used by the PaddleOCR recognition path.</span>}
       </header>
       <form className="training-config" onSubmit={startTraining}>
         <label>Dataset snapshot<select value={selectedSnapshot[type]} onChange={(e) => setSelectedSnapshot((old) => ({ ...old, [type]: e.target.value }))} required>
@@ -509,6 +503,10 @@ export default function App() {
       <p className="training-source-note">{isOcr
         ? 'Snapshot source: verified OCR text from imported OCR data and verified plate annotations. Crops from one source image stay in the same split.'
         : 'Snapshot source: verified plate boxes in the selected immutable detector dataset snapshot.'}</p>
+      {isOcr && <p className="training-source-note ocr-engine-note">
+        <strong>Engine: CRNN</strong> (CNN + BiLSTM + CTC, alphabet 0-9A-Z, 12 characters max). Recognition uses <strong>PaddleOCR</strong> PP-OCRv6-tiny,
+        which cannot load these weights, so a finished CRNN run cannot be activated or selected for inference. It is kept for studying the training loop only.
+      </p>}
       {isOcr && <OCRDatasetReview />}
       {trained ? <section className="training-status" aria-live="polite">
         <div className="training-status-head"><strong>{isOcr ? 'OCR' : 'Detector'} · {trained.status}</strong>
@@ -560,7 +558,7 @@ export default function App() {
       </nav>
     </header>
     {section === 'production' && <>
-    <div className="production-heading"><div><h2>Verify Datasets</h2><p>Review images and verify plate boxes before creating training snapshots.</p></div>
+    <div className="production-heading"><div><h2>Verify Datasets</h2><p>Detection and OCR need different ground truth, so they are verified separately.</p></div>
       <div className="snapshot-actions">
         <button onClick={() => void syncDatasetsFolder()} disabled={busy || syncing}>{syncing ? 'Scanning…' : 'Sync datasets/imports/'}</button>
         <button onClick={() => void createSnapshot('detector')} disabled={busy}>Build detector snapshot</button>
@@ -570,6 +568,19 @@ export default function App() {
     </div>
     <section className="snapshot-list"><strong>Immutable snapshots</strong>{snapshots.length ? snapshots.map((item) => <span key={item.id}><b>{item.task}</b> · {item.id.slice(0, 8)} · {item.split_counts.train}/{item.split_counts.val}/{item.split_counts.test} train/val/test · {item.manifest_sha256.slice(0, 12)} <button className="delete-snapshot" onClick={() => void deleteSnapshot(item)} title="Delete snapshot">×</button></span>) : <span>No snapshots created yet.</span>}</section>
     {datasetMetrics && <section className="metrics-dashboard dataset-dashboard"><div className="metric"><span>Total images</span><strong>{datasetMetrics.total_images.toLocaleString()}</strong></div><div className="metric"><span>Verified plates</span><strong>{datasetMetrics.verified_plates.toLocaleString()}</strong></div><div className="metric"><span>Needs review</span><strong>{datasetMetrics.images_needing_review.toLocaleString()}</strong></div><div className="metric"><span>OCR exact match</span><strong>{percent(datasetMetrics.ocr_exact_match_accuracy)}</strong></div><div className="metric"><span>Character error rate</span><strong>{percent(datasetMetrics.character_error_rate)}</strong></div><div className="metric"><span>Detection recall</span><strong>{percent(datasetMetrics.detection_recall)}</strong></div><button className="metrics-refresh" onClick={() => void refreshDatasetMetrics()} disabled={busy}>Refresh statistics</button></section>}
+    <nav className="verify-views" aria-label="Verification views">
+      {([['detection', 'Detection', 'Boxes and plate locations for YOLO. OCR text is not required here.'],
+         ['ocr', 'OCR Text', 'Exact characters on each plate for PaddleOCR recognition.'],
+         ['samples', 'All Samples', 'Detection and OCR readiness side by side.']] as const).map(([id, label, hint]) =>
+        <button type="button" key={id} className={verifyView === id ? 'active' : ''} onClick={() => setVerifyView(id)} title={hint}>{label}</button>)}
+    </nav>
+
+    {verifyView !== 'detection' && <>
+      {verifyView === 'ocr' && <OCRTextReview source={source} onOpenDetection={(id) => { void openImageInDetection(id); setVerifyView('detection'); }} />}
+      {verifyView === 'samples' && <AllSamples source={source} onOpen={(id) => { void openImageInDetection(id); setVerifyView('detection'); }} />}
+    </>}
+
+    {verifyView === 'detection' && <>
     {activeJobs.length > 0 && <section className="queue-status" aria-live="polite">
       <strong>Detection queue</strong>{activeJobs.map((item) => <div className="queue-item" key={item.id}>
         <span>{item.kind === 'batch' ? 'Batch' : 'Image'} · {item.status === 'queued' ? 'Waiting' : 'Running'}</span><span>{item.completed.toLocaleString()} / {item.total.toLocaleString()} complete</span>
@@ -642,7 +653,8 @@ export default function App() {
       </aside>
     </section>
     {message && <div className="status" role="status">{message}</div>}
-    <footer>AI boxes are orange; manual boxes are green. OCR guesses are never saved as ground truth automatically. Save label edits before changing review status. Shortcuts: ←/→ or P/N navigate · Ctrl/⌘+S save · V verify · Delete remove selected box · T focus plate text.</footer>
+    <footer>AI boxes are orange; manual boxes are green. <strong>OCR text is not required for detection training</strong> — a sample with verified boxes and no text is still detection-ready. Saving box or text edits returns the image to "Needs review" for both tasks, so verify it again afterwards. Predictions are never saved as ground truth automatically. Shortcuts: ←/→ or P/N navigate · Ctrl/⌘+S save · V verify · Delete remove selected box · T focus plate text.</footer>
+    </>}
     </>}
     {section === 'detector' && renderTrainingSection('detector', detectorTrainingJob)}
     {section === 'ocr' && renderTrainingSection('ocr', ocrTrainingJob)}

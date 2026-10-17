@@ -12,7 +12,7 @@ from pathlib import Path
 
 import cv2
 import torch
-from sqlalchemy import select
+from sqlalchemy import func, select
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
@@ -118,7 +118,11 @@ def _collect_crops(job_id: str, training_dir: Path, snapshot_id: str | None = No
             .where(
                 ImageRecord.review_status == "verified",
                 ImageRecord.verified_at.is_not(None),
+                # Empty and whitespace-only values are not verified text. Rows
+                # imported from YOLO sidecars carry "", and treating those as
+                # ground truth would put blank labels into the OCR training set.
                 Annotation.verified_result.is_not(None),
+                func.trim(Annotation.verified_result) != "",
             )
             .order_by(ImageRecord.id, Annotation.id)
         ).all()

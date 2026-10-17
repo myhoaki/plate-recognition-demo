@@ -12,6 +12,15 @@ class SaveAnnotations(BaseModel):
     annotations: list[LabelInput] = Field(max_length=100)
 
 
+class OcrTextEntry(BaseModel):
+    annotation_id: int
+    verified_result: str = Field(default="", max_length=32)
+
+
+class OcrTextUpdate(BaseModel):
+    plates: list[OcrTextEntry] = Field(max_length=100)
+
+
 class StartDetection(BaseModel):
     image_id: str
 

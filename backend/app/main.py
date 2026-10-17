@@ -18,20 +18,42 @@ from sqlalchemy.orm import Session, selectinload
 from . import models  # noqa: F401 - register ORM metadata
 from .celery_app import celery_app
 from .database import Base, SessionLocal, engine, get_db
-from .logic import annotation_payload, image_payload, iou, metrics_payload, sync_datasets_folder
+from .logic import (
+    OCR_ENGINE_MISMATCH_MESSAGE,
+    OCR_INFERENCE_ENGINE,
+    OCR_TRAINING_ENGINE,
+    annotation_payload,
+    image_payload,
+    iou,
+    metrics_payload,
+    ocr_checkpoint_is_usable,
+    ocr_training_engine,
+    plate_counts_for_images,
+    readiness_predicate,
+    sync_datasets_folder,
+    verification_summary,
+)
 from .models import Annotation, DatasetSnapshot, DetectionJob, EvaluationJob, ImageRecord, TrainingJob, utcnow
-from .schemas import ImportSnapshot, RecognitionRequest, SaveAnnotations, SetReviewStatus, SetVerification, StartDetection, StartEvaluation, StartTraining, UpdateOcrSample
+from .schemas import ImportSnapshot, OcrTextUpdate, RecognitionRequest, SaveAnnotations, SetReviewStatus, SetVerification, StartDetection, StartEvaluation, StartTraining, UpdateOcrSample
 from .storage import DATASETS_DIR, UPLOADS_DIR, image_path, save_upload
 from .tasks import run_detection_job  # noqa: F401 - register Celery task
 from .training import run_training_job
 from .datasets import create_detection_snapshot, tree_sha256, verify_snapshot
-from .pipeline import run_detection
+from .pipeline import OcrCheckpointError, run_detection
 from .evaluation import run_evaluation_job  # noqa: F401 - register Celery task
 
 _batch_queue_lock = Lock()
 _ocr_csv_lock = Lock()
 
 DETECTION_TASK_NAME = "platelens.run_detection_job"
+
+
+def ocr_engine_mismatch_detail(job_config: dict | None) -> str:
+    """Actionable message for an OCR checkpoint this pipeline cannot run."""
+    return OCR_ENGINE_MISMATCH_MESSAGE.format(
+        engine=ocr_training_engine(job_config).upper(),
+        inference=OCR_INFERENCE_ENGINE.upper(),
+    )
 
 
 def _worker_detection_tasks():
@@ -87,7 +109,12 @@ def list_models(db: Session = Depends(get_db)):
     for job in jobs:
         model_type = (job.config or {}).get("model_type", "detector")
         if model_type in {"detector", "ocr"} and job.model_path and Path(job.model_path).is_file():
-            output.append({"job_id": job.id, "model_type": model_type, "created_at": job.finished_at, "best_epoch": (job.metrics or {}).get("best_epoch")})
+            # `usable` is False for checkpoints this pipeline cannot actually run,
+            # so the UI does not present them as working model choices.
+            output.append({"job_id": job.id, "model_type": model_type, "created_at": job.finished_at,
+                           "best_epoch": (job.metrics or {}).get("best_epoch"),
+                           "engine": ocr_training_engine(job.config) or "yolo",
+                           "usable": model_type == "detector" or ocr_checkpoint_is_usable(job.config)})
     return {"models": output}
 
 
@@ -107,6 +134,8 @@ def recognize_image(payload: RecognitionRequest, db: Session = Depends(get_db)):
         job = db.get(TrainingJob, job_id)
         if not job or job.status != "completed" or (job.config or {}).get("model_type", "detector") != model_type or not job.model_path:
             raise HTTPException(400, f"Select a completed {model_type} checkpoint.")
+        if model_type == "ocr" and not ocr_checkpoint_is_usable(job.config):
+            raise HTTPException(400, ocr_engine_mismatch_detail(job.config))
         path = Path(job.model_path).resolve()
         try:
             path.relative_to((training_dir / "jobs" / job.id).resolve())
@@ -116,15 +145,20 @@ def recognize_image(payload: RecognitionRequest, db: Session = Depends(get_db)):
             raise HTTPException(404, "Selected checkpoint file is missing.")
         return str(path)
 
+    # Validate model selection before touching the filesystem, so an unusable
+    # checkpoint is reported as such instead of as a missing image.
+    detector = selected_checkpoint(payload.detector_job_id, "detector")
+    ocr = selected_checkpoint(payload.ocr_job_id, "ocr")
     try:
         path = image_path(image.source, image.original_filename, image.storage_key)
     except FileNotFoundError:
         raise HTTPException(404, "Image file not found") from None
-    detector = selected_checkpoint(payload.detector_job_id, "detector")
-    ocr = selected_checkpoint(payload.ocr_job_id, "ocr")
     started = perf_counter()
     try:
         detections = run_detection(path, detector, ocr)
+    except OcrCheckpointError as exc:
+        # A selected-but-unusable recogniser is a bad request, not a pipeline failure.
+        raise HTTPException(400, str(exc)[:500]) from None
     except Exception as exc:
         raise HTTPException(422, f"Recognition failed: {str(exc)[:500]}") from None
     import base64
@@ -432,6 +466,8 @@ def start_evaluation(payload: StartEvaluation, db: Session = Depends(get_db)):
             job = db.get(TrainingJob, job_id)
             if not job or job.status != "completed" or (job.config or {}).get("model_type", "detector") != model_type:
                 raise HTTPException(400, f"Select a completed {model_type} checkpoint.")
+            if model_type == "ocr" and not ocr_checkpoint_is_usable(job.config):
+                raise HTTPException(400, ocr_engine_mismatch_detail(job.config))
     job = EvaluationJob(id=uuid4().hex, status="queued", config=payload.model_dump())
     db.add(job)
     db.commit()
@@ -447,6 +483,12 @@ def get_evaluation(job_id: str, db: Session = Depends(get_db)):
     return evaluation_payload(job)
 
 
+@app.get("/api/verification/summary")
+def verification_summary_endpoint(source: str | None = None, db: Session = Depends(get_db)):
+    """Per-task readiness counts for the "All Samples" view."""
+    return {"source": source, **verification_summary(db, source)}
+
+
 @app.get("/api/images")
 def list_images(
     source: str = "registered",
@@ -455,6 +497,7 @@ def list_images(
     review: str = "all",
     threshold: float = 0.7,
     review_status: str = "all",
+    readiness: str = "all",
     db: Session = Depends(get_db),
 ):
     if source not in {"registered", "upload", "datasets_folder"}:
@@ -463,6 +506,12 @@ def list_images(
         raise HTTPException(400, "Unsupported confidence review filter")
     if review_status not in {"all", "needs_review", "reviewed", "verified", "rejected", "no_plate"}:
         raise HTTPException(400, "Unsupported image review status filter")
+    # Readiness filters are applied after the fact in Python because detection and
+    # OCR readiness are derived per image from plate counts, which SQLAlchemy cannot
+    # express as a single cheap predicate over the aggregated result.
+    if readiness not in {"all", "detection_verified", "detection_needs_review", "ocr_verified",
+                         "ocr_partial", "ocr_missing", "ocr_blocked", "ready_for_both"}:
+        raise HTTPException(400, "Unsupported readiness filter")
     if not 0 <= threshold <= 1:
         raise HTTPException(400, "Confidence threshold must be between 0 and 1")
     limit = min(max(limit, 1), 500)
@@ -470,6 +519,11 @@ def list_images(
     query = select(ImageRecord).where(ImageRecord.source == source)
     if review_status != "all":
         query = query.where(ImageRecord.review_status == review_status)
+    # Applied in SQL (not to the fetched page) so that offset/limit paginate over
+    # the matching rows instead of over all rows and then dropping most of them.
+    readiness_clause = readiness_predicate(readiness)
+    if readiness_clause is not None:
+        query = query.where(readiness_clause)
     detection_confidence = (
         select(func.min(Annotation.detection_confidence))
         .where(Annotation.image_id == ImageRecord.id, Annotation.ai_detection.is_(True))
@@ -516,7 +570,9 @@ def list_images(
         .offset(offset)
         .limit(limit)
     ).all()
-    return {"images": [image_payload(item) for item in rows], "total": total, "limit": limit, "offset": offset}
+    counts = plate_counts_for_images(db, [row.id for row in rows])
+    payloads = [image_payload(row, plate_counts=counts) for row in rows]
+    return {"images": payloads, "total": total, "limit": limit, "offset": offset}
 
 
 @app.post("/api/images/upload")
@@ -614,6 +670,42 @@ def image_file(image_id: str, db: Session = Depends(get_db)):
     except FileNotFoundError:
         raise HTTPException(404, "Image file not found") from None
     return FileResponse(path)
+
+
+@app.put("/api/images/{image_id}/ocr-text")
+def update_ocr_text(image_id: str, payload: OcrTextUpdate, db: Session = Depends(get_db)):
+    """Update only the ground-truth transcription of existing plates.
+
+    Bounding boxes and the image review status are deliberately untouched. The
+    combined annotations endpoint resets review_status on every save, which
+    would discard a user's detection verification every time they corrected a
+    piece of OCR text.
+
+    A plate's text is only ever stored from what the user typed. An existing
+    model prediction (ai_result) is returned for reference and is never copied
+    into verified_result.
+    """
+    image = db.scalar(
+        select(ImageRecord)
+        .options(selectinload(ImageRecord.annotations))
+        .where(ImageRecord.id == image_id)
+    )
+    if not image:
+        raise HTTPException(404, "Image not found")
+    existing = {item.id: item for item in image.annotations}
+    seen: set[int] = set()
+    for entry in payload.plates:
+        annotation = existing.get(entry.annotation_id)
+        if annotation is None or entry.annotation_id in seen:
+            raise HTTPException(400, "A plate in this update does not belong to the image.")
+        seen.add(entry.annotation_id)
+        text = entry.verified_result.strip()
+        if len(text) > 32:
+            raise HTTPException(400, "Plate text must be 32 characters or fewer.")
+        annotation.verified_result = text or None
+    db.commit()
+    db.refresh(image)
+    return {"image": image_payload(image, include_annotations=True)}
 
 
 @app.post("/api/images/{image_id}/annotations")
@@ -875,6 +967,10 @@ def start_training(payload: StartTraining, db: Session = Depends(get_db)):
     ):
         raise HTTPException(409, "Wait for active image detection to finish before training the detector.")
     config = payload.model_dump()
+    if config.get("model_type") == "ocr":
+        # Record the architecture so checkpoint selection never has to guess. CRNN
+        # output is not loadable by the PaddleOCR inference path.
+        config["ocr_engine"] = OCR_TRAINING_ENGINE
     job = TrainingJob(
         id=uuid4().hex,
         status="queued",
@@ -956,6 +1052,17 @@ def activate_training_model(job_id: str, db: Session = Depends(get_db)):
     job = db.get(TrainingJob, job_id)
     if not job or job.status != "completed" or not job.model_path:
         raise HTTPException(400, "A completed training job is required.")
+    model_type = (job.config or {}).get("model_type", "detector")
+    if model_type == "ocr":
+        # Refuse rather than "fix" the active_ocr.pt / active_ocr mismatch: making
+        # that path resolve would activate a CRNN checkpoint that PaddleOCR cannot
+        # load, silently turning OCR off for every later request. Checked before
+        # the path checks so the reason is never masked by a missing file.
+        raise HTTPException(
+            400,
+            ocr_engine_mismatch_detail(job.config)
+            + " This checkpoint is not activated, so it cannot change recognition.",
+        )
     training_dir = Path(os.environ.get("TRAINING_DIR", "/training")).resolve()
     model_path = Path(job.model_path).resolve()
     try:
@@ -964,13 +1071,8 @@ def activate_training_model(job_id: str, db: Session = Depends(get_db)):
         raise HTTPException(400, "Training model path is invalid.") from None
     if not model_path.is_file():
         raise HTTPException(404, "Trained model file not found.")
-    model_type = (job.config or {}).get("model_type", "detector")
-    if model_type == "ocr":
-        active_path = training_dir / "active_ocr.pt"
-        temporary_path = training_dir / "active_ocr.pt.tmp"
-    else:
-        active_path = training_dir / "active_detector.pt"
-        temporary_path = training_dir / "active_detector.pt.tmp"
+    active_path = training_dir / "active_detector.pt"
+    temporary_path = training_dir / "active_detector.pt.tmp"
     temporary_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(model_path, temporary_path)
     os.replace(temporary_path, active_path)

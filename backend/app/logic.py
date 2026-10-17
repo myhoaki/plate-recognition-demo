@@ -1,4 +1,4 @@
-from sqlalchemy import func, select
+from sqlalchemy import and_, exists, func, select
 from sqlalchemy.orm import Session
 
 from .models import Annotation, ImageRecord
@@ -13,7 +13,104 @@ def iou(first: list[float], second: list[float]) -> float:
     return intersection / max(1.0, a + b - intersection)
 
 
-def image_payload(image: ImageRecord, include_annotations: bool = False) -> dict:
+# The OCR trainer in this project is the CRNN in ocr_model.py, while recognition
+# runs PaddleOCR. They are different architectures, so a CRNN checkpoint is not a
+# usable inference checkpoint. These constants keep that distinction explicit
+# instead of letting it be inferred from a job type.
+OCR_INFERENCE_ENGINE = "paddleocr"
+OCR_TRAINING_ENGINE = "crnn"
+
+OCR_ENGINE_MISMATCH_MESSAGE = (
+    "The selected OCR training run produced a {engine} checkpoint, but recognition runs "
+    "{inference}. These are different architectures and cannot be interchanged, so this "
+    "checkpoint cannot be used. Clear the OCR checkpoint selection to use the bundled "
+    "PaddleOCR PP-OCRv6-tiny recogniser. Training a PaddleOCR recogniser is not implemented yet."
+)
+
+
+def ocr_training_engine(job_config: dict | None) -> str:
+    """Return which recogniser architecture an OCR training run produced.
+
+    Returns "" for non-OCR jobs. Runs recorded before ``ocr_engine`` existed are
+    treated as CRNN, because CRNN is the only OCR trainer this project has.
+    """
+    config = job_config or {}
+    if config.get("model_type", "detector") != "ocr":
+        return ""
+    return str(config.get("ocr_engine") or OCR_TRAINING_ENGINE)
+
+
+def ocr_checkpoint_is_usable(job_config: dict | None) -> bool:
+    """Whether a completed training job's checkpoint can drive OCR inference."""
+    return ocr_training_engine(job_config) == OCR_INFERENCE_ENGINE
+
+
+# Review statuses that mean "a human looked at this image and approved it".
+_REVIEW_APPROVED = "verified"
+# Statuses that mean the image is deliberately excluded from ground truth.
+_REVIEW_EXCLUDED = {"rejected", "no_plate"}
+
+
+def image_readiness(
+    review_status: str,
+    verified_at,
+    plate_count: int = 0,
+    verified_text_count: int = 0,
+) -> dict:
+    """Derived, per-task readiness for one image. Never stored, never auto-set.
+
+    Detection and OCR need different ground truth, so they are reported
+    independently:
+
+    * detection needs a human-approved image that has at least one box.
+      Plate text is irrelevant to it.
+    * OCR additionally needs verified ground-truth text on the plates. The
+      image gate is shared because a trustworthy crop depends on a verified box.
+
+    This mirrors the eligibility rules used when the snapshots are built
+    (training.py for detection, ocr_training.py for OCR) so the UI cannot
+    promise a sample the dataset builder would then drop.
+    """
+    plate_count = max(0, int(plate_count or 0))
+    verified_text_count = max(0, int(verified_text_count or 0))
+    approved = review_status == _REVIEW_APPROVED and verified_at is not None
+
+    if review_status in _REVIEW_EXCLUDED:
+        detection_status = review_status
+    elif plate_count == 0:
+        detection_status = "no_boxes"
+    elif approved:
+        detection_status = _REVIEW_APPROVED
+    else:
+        detection_status = "needs_review"
+
+    if plate_count == 0:
+        ocr_status = "no_boxes"
+    elif not approved:
+        ocr_status = "blocked"
+    elif verified_text_count <= 0:
+        ocr_status = "missing"
+    elif verified_text_count >= plate_count:
+        ocr_status = _REVIEW_APPROVED
+    else:
+        ocr_status = "partial"
+
+    return {
+        "plate_count": plate_count,
+        "verified_text_count": verified_text_count,
+        "detection_status": detection_status,
+        "detection_ready": detection_status == _REVIEW_APPROVED,
+        "ocr_status": ocr_status,
+        "ocr_ready": ocr_status == _REVIEW_APPROVED,
+        "ready_for_both": detection_status == _REVIEW_APPROVED and ocr_status == _REVIEW_APPROVED,
+    }
+
+
+def image_payload(
+    image: ImageRecord,
+    include_annotations: bool = False,
+    plate_counts: dict | None = None,
+) -> dict:
     data = {
         "id": image.id,
         "source": image.source,
@@ -27,7 +124,12 @@ def image_payload(image: ImageRecord, include_annotations: bool = False) -> dict
         "file_url": f"/api/images/{image.id}/file",
     }
     if include_annotations:
-        data["annotations"] = [annotation_payload(item) for item in image.annotations]
+        annotations = list(image.annotations)
+        data["annotations"] = [annotation_payload(item) for item in annotations]
+        counts = (len(annotations), sum(1 for item in annotations if item.verified_result))
+    else:
+        counts = (plate_counts or {}).get(image.id, (0, 0))
+    data.update(image_readiness(image.review_status, image.verified_at, *counts))
     return data
 
 
@@ -64,6 +166,102 @@ def _edit_distance(first: str, second: str) -> int:
             ))
         previous = current
     return previous[-1]
+
+
+def _text_is_set():
+    """SQL predicate: a plate has usable ground-truth text.
+
+    Empty and whitespace-only values count as missing, matching the API, which
+    stores None for them.
+    """
+    return and_(Annotation.verified_result.is_not(None), func.trim(Annotation.verified_result) != "")
+
+
+def readiness_predicate(readiness: str):
+    """SQL predicate for the per-task readiness filters.
+
+    Applied inside the query so pagination stays correct: filtering a page
+    after it was fetched would silently miss matching rows.
+    """
+    if readiness == "all":
+        return None
+    approved = and_(ImageRecord.review_status == "verified", ImageRecord.verified_at.is_not(None))
+    excluded = ImageRecord.review_status.in_(("rejected", "no_plate"))
+    has_plate = exists(select(Annotation.id).where(Annotation.image_id == ImageRecord.id))
+    has_text = exists(select(Annotation.id).where(Annotation.image_id == ImageRecord.id, _text_is_set()))
+    lacks_text = exists(select(Annotation.id).where(Annotation.image_id == ImageRecord.id, ~_text_is_set()))
+    return {
+        "detection_verified": and_(approved, has_plate),
+        "detection_needs_review": and_(has_plate, ~approved, ~excluded),
+        "ocr_verified": and_(approved, has_plate, ~lacks_text),
+        "ocr_partial": and_(approved, has_plate, has_text, lacks_text),
+        "ocr_missing": and_(approved, has_plate, ~has_text),
+        "ocr_blocked": and_(has_plate, ~approved),
+        "ready_for_both": and_(approved, has_plate, ~lacks_text),
+    }[readiness]
+
+
+def plate_counts_for_images(db: Session, image_ids: list[str]) -> dict[str, tuple[int, int]]:
+    """Map image_id -> (plate_count, verified_text_count) in a single query.
+
+    Keeps the image list from issuing one query per row when readiness is added.
+    """
+    if not image_ids:
+        return {}
+    rows = db.execute(
+        select(
+            Annotation.image_id,
+            func.count(Annotation.id),
+            func.count(Annotation.id).filter(_text_is_set()),
+        )
+        .where(Annotation.image_id.in_(image_ids))
+        .group_by(Annotation.image_id)
+    ).all()
+    return {row[0]: (row[1], row[2]) for row in rows}
+
+
+def verification_summary(db: Session, source: str | None = None) -> dict:
+    """Counts for the "All Samples" view, derived from real rows only."""
+    scope = [ImageRecord.source == source] if source else []
+    images = db.execute(
+        select(
+            ImageRecord.id,
+            ImageRecord.review_status,
+            ImageRecord.verified_at,
+            func.count(Annotation.id),
+            func.count(Annotation.id).filter(_text_is_set()),
+        )
+        .outerjoin(Annotation, Annotation.image_id == ImageRecord.id)
+        .where(*scope)
+        .group_by(ImageRecord.id)
+    ).all()
+
+    counts: dict[str, int] = {
+        "total_images": 0, "with_boxes": 0,
+        "detection_verified": 0, "detection_needs_review": 0, "detection_excluded": 0,
+        "ocr_verified": 0, "ocr_partial": 0, "ocr_missing": 0, "ocr_blocked": 0,
+        "ready_for_both": 0,
+        "plates_total": 0, "plates_verified_text": 0, "plates_prediction_only": 0,
+    }
+    for _id, review_status, verified_at, plates, texts in images:
+        state = image_readiness(review_status, verified_at, plates, texts)
+        counts["total_images"] += 1
+        counts["plates_total"] += state["plate_count"]
+        counts["plates_verified_text"] += state["verified_text_count"]
+        if state["plate_count"] == 0:
+            continue
+        counts["with_boxes"] += 1
+        counts["plates_prediction_only"] += state["plate_count"] - state["verified_text_count"]
+        if state["detection_status"] in _REVIEW_EXCLUDED:
+            counts["detection_excluded"] += 1
+        elif state["detection_ready"]:
+            counts["detection_verified"] += 1
+        else:
+            counts["detection_needs_review"] += 1
+        counts[f"ocr_{state['ocr_status']}"] = counts.get(f"ocr_{state['ocr_status']}", 0) + 1
+        if state["ready_for_both"]:
+            counts["ready_for_both"] += 1
+    return counts
 
 
 def metrics_payload(db: Session) -> dict:

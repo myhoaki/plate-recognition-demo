@@ -107,6 +107,15 @@ def configure_ultralytics_paths(training_dir: Path | None = None) -> Path:
     return runs_dir
 
 
+class OcrCheckpointError(RuntimeError):
+    """A selected OCR checkpoint cannot be used by the PaddleOCR inference path.
+
+    Raised only for an explicitly selected checkpoint. A failure to load the
+    bundled default PaddleOCR model still degrades to "no OCR" so that detection
+    keeps working.
+    """
+
+
 @lru_cache(maxsize=2)
 def _get_paddle_ocr(
     model_dir: str | None, model_mtime_ns: int
@@ -118,17 +127,33 @@ def _get_paddle_ocr(
     PaddleOCR's text-detection and orientation models are redundant work.
 
     The import is deferred so an unavailable or misconfigured PaddleOCR install
-    cannot stop the API from starting; detection still works without OCR.
+    cannot stop the API from starting; detection still works without OCR. That
+    leniency applies to the *bundled default* only: when a caller explicitly
+    selects a checkpoint, a load failure is raised as OcrCheckpointError so an
+    incompatible selection (for example a CRNN .pt) is reported instead of
+    silently returning empty text for every plate.
     """
     try:
         from paddleocr import TextRecognition  # noqa: PLC0415 - lazy import
-    except Exception:
+    except Exception as exc:
+        if model_dir:
+            raise OcrCheckpointError(
+                f"PaddleOCR is not available to load the selected OCR checkpoint "
+                f"({model_dir}): {exc}"
+            ) from exc
         return None
     try:
         if model_dir:
             return TextRecognition(model_dir=model_dir)
         return TextRecognition(model_name=PADDLE_OCR_MODEL)
-    except Exception:
+    except Exception as exc:
+        if model_dir:
+            raise OcrCheckpointError(
+                f"The selected OCR checkpoint could not be loaded by PaddleOCR "
+                f"({model_dir}). PaddleOCR expects one of its own model directories; a "
+                f"CRNN .pt checkpoint is not compatible. Clear the OCR checkpoint "
+                f"selection to use the bundled PP-OCRv6-tiny model. Cause: {exc}"
+            ) from exc
         return None
 
 
@@ -138,22 +163,26 @@ def get_models(
 ) -> tuple[TrainedYoloDetector | None, "TextRecognition | None"]:
     """Return (detector, ocr) instances.
 
-    Prefers active checkpoints (active_detector.pt / active_ocr) when present,
-    otherwise uses the provided checkpoint paths. If no detector checkpoint is
+    Prefers the active detector checkpoint (active_detector.pt) when present,
+    otherwise uses the provided checkpoint path. If no detector checkpoint is
     available, detector is None and callers must handle that (YOLO26 pretrained
     on COCO does not detect license plates — training is required).
+
+    No active *OCR* checkpoint is consulted. The only OCR trainer in this
+    project emits CRNN weights, which PaddleOCR cannot load; honouring such a
+    file here would silently disable recognition instead of using PaddleOCR.
+    OCR inference therefore always uses the bundled PaddleOCR model unless an
+    explicit, PaddleOCR-compatible checkpoint is supplied.
     """
     training_dir = Path(os.environ.get("TRAINING_DIR", "/training"))
     active_detector_path = training_dir / "active_detector.pt"
-    active_ocr_path = training_dir / "active_ocr"
 
     detector_path = detector_checkpoint or (
         str(active_detector_path) if active_detector_path.is_file() else None
     )
-    ocr_path = ocr_checkpoint or (str(active_ocr_path) if active_ocr_path.is_file() else None)
 
     detector = TrainedYoloDetector(detector_path) if detector_path else None
-    ocr = _get_paddle_ocr(ocr_path, 0) if ocr_path else _get_paddle_ocr(None, 0)
+    ocr = _get_paddle_ocr(ocr_checkpoint, 0) if ocr_checkpoint else _get_paddle_ocr(None, 0)
     return detector, ocr
 
 
