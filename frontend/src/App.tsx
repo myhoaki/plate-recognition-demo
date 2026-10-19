@@ -1,10 +1,9 @@
-import { Fragment, type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Circle, Image as KImage, Layer, Rect, Stage, Text } from 'react-konva';
-import type Konva from 'konva';
+import { type FormEvent, useCallback, useEffect, useRef, useState } from 'react';
 import RecognitionTest from './RecognitionTest';
 import OCRDatasetReview from './OCRDatasetReview';
 import OCRTextReview from './OCRTextReview';
 import AllSamples from './AllSamples';
+import AnnotationCanvas, { type AnnotationCanvasHandle } from './AnnotationCanvas';
 import PlateCrop from './PlateCrop';
 
 type Annotation = {
@@ -19,7 +18,7 @@ type DashboardMetrics = { total_images: number; verified_plates: number; images_
 type ImageRecord = { id: string; filename: string; width: number; height: number; detection_complete: boolean; verified: boolean; review_status: ReviewStatus; verified_at?: string | null; file_url: string; annotations?: Annotation[] };
 type Job = { job_id?: string; id?: string; kind?: 'single' | 'batch'; status: string; total: number; completed: number; detected: number; failed: number; error?: string | null; existing?: boolean };
 type EpochStats = { epoch: number; is_best?: boolean; [key: string]: number | boolean | undefined };
-type TrainingJob = { id: string; status: string; model_type: 'detector' | 'ocr'; cancel_requested: boolean; config: { epochs: number; batch_size: number; image_size?: number; device: string }; split_counts: Record<string, number>; current_epoch: number; total_epochs: number; current_batch: number; total_batches: number; current_val: number; total_val: number; current_test: number; total_test: number; metrics: Record<string, number>; epoch_history: EpochStats[]; best_epoch: number | null; best_score: number | null; best_metrics: Record<string, number>; model_ready: boolean; error?: string | null };
+type TrainingJob = { id: string; status: string; model_type: 'detector' | 'ocr'; cancel_requested: boolean; config: { epochs: number; batch_size: number; image_size?: number; workers?: number; device: string }; split_counts: Record<string, number>; current_epoch: number; total_epochs: number; current_batch: number; total_batches: number; current_val: number; total_val: number; current_test: number; total_test: number; metrics: Record<string, number>; epoch_history: EpochStats[]; best_epoch: number | null; best_score: number | null; best_metrics: Record<string, number>; model_ready: boolean; error?: string | null };
 type Box = { bbox_xyxy_pixels: number[]; verified_result: string; ai_detection: boolean; ai_result?: string | null; detection_confidence?: number | null; ocr_confidence?: number | null; country?: string | null; country_confidence?: number | null };
 const PAGE_SIZE = 500;
 
@@ -48,9 +47,10 @@ const [verifyView, setVerifyView] = useState<'detection' | 'ocr' | 'samples'>('d
   const [statusFilter, setStatusFilter] = useState<'all' | ReviewStatus>('all');
   const [filteringImages, setFilteringImages] = useState(false);
   const [boxes, setBoxes] = useState<Box[]>([]);
+const [undoStack, setUndoStack] = useState<Box[][]>([]);
+const [redoStack, setRedoStack] = useState<Box[][]>([]);
+const [mode, setMode] = useState<'select' | 'draw'>('select');
   const [imageEl, setImageEl] = useState<HTMLImageElement | null>(null);
-  const [stageSize, setStageSize] = useState({ width: 800, height: 520 });
-  const [zoom, setZoom] = useState(1);
   const [busy, setBusy] = useState(false);
   const [dirtyImageId, setDirtyImageId] = useState<string | null>(null);
   const [message, setMessage] = useState('');
@@ -61,12 +61,13 @@ const [verifyView, setVerifyView] = useState<'detection' | 'ocr' | 'samples'>('d
   const [snapshots, setSnapshots] = useState<DatasetSnapshot[]>([]);
   const [datasetMetrics, setDatasetMetrics] = useState<DashboardMetrics | null>(null);
   const [selectedSnapshot, setSelectedSnapshot] = useState({ detector: '', ocr: '' });
-  const [trainingConfig, setTrainingConfig] = useState({ epochs: 30, batch_size: 8, image_size: 640, device: 'auto' });
-  const [drawing, setDrawing] = useState<number[] | null>(null);
+  const [trainingConfig, setTrainingConfig] = useState({ epochs: 30, batch_size: 8, image_size: 640, workers: 2, device: 'auto' });
   const [selectedBoxIndex, setSelectedBoxIndex] = useState<number | null>(null);
   const ocrInputRefs = useRef<Array<HTMLInputElement | null>>([]);
   const imageLoadSequence = useRef(0);
-  const stageRef = useRef<Konva.Stage>(null);
+  const canvasApi = useRef<AnnotationCanvasHandle>(null);
+  const editSnapshot = useRef<Box[] | null>(null);
+  const [zoomLabel, setZoomLabel] = useState(100);
   const current = images[index];
   const jobActive = job?.status === 'queued' || job?.status === 'running';
   const batchActive = activeJobs.some((item) => item.kind === 'batch');
@@ -238,20 +239,8 @@ const [verifyView, setVerifyView] = useState<'detection' | 'ocr' | 'samples'>('d
     return () => { cancelled = true; };
   }, [current?.id, current?.file_url]);
 
-  useEffect(() => {
-    const fit = () => {
-      const maxW = Math.max(320, window.innerWidth - 430);
-      const maxH = Math.max(300, window.innerHeight - 190);
-      const ratio = current ? current.width / current.height : 1.5;
-      let width = Math.min(maxW, 1200), height = width / ratio;
-      if (height > maxH) { height = maxH; width = height * ratio; }
-      setStageSize({ width, height });
-    };
-    fit(); window.addEventListener('resize', fit); return () => window.removeEventListener('resize', fit);
-  }, [current?.width, current?.height]);
-
-  const scale = useMemo(() => current ? stageSize.width / current.width * zoom : zoom, [current, stageSize.width, zoom]);
   const move = (n: number) => {
+    if (hasUnsaved && !window.confirm('This image has unsaved annotation edits. Discard them and move on?')) return;
     if (n < 0 && index === 0 && pageOffset > 0) {
       const offset = Math.max(0, pageOffset - PAGE_SIZE);
       void loadImages(source, undefined, offset).then(() => setIndex(Math.min(PAGE_SIZE - 1, imageTotal - offset - 1)));
@@ -260,6 +249,7 @@ const [verifyView, setVerifyView] = useState<'detection' | 'ocr' | 'samples'>('d
     } else {
       setIndex((i) => Math.max(0, Math.min(images.length - 1, i + n)));
     }
+    setUndoStack([]); setRedoStack([]); setSelectedBoxIndex(null);
   };
   const jumpToOrder = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -363,7 +353,7 @@ const [verifyView, setVerifyView] = useState<'detection' | 'ocr' | 'samples'>('d
       setMessage(stopped.status === 'cancelled' ? 'Training stopped.' : 'Stop requested. Training will stop after the current batch.');
     } catch (e) { setMessage((e as Error).message); } finally { setBusy(false); }
   };
-  const save = async () => {
+  const save = async (andNext = false) => {
     if (!current) return;
     setBusy(true); setMessage('Saving annotations…');
     try {
@@ -371,12 +361,17 @@ const [verifyView, setVerifyView] = useState<'detection' | 'ocr' | 'samples'>('d
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ annotations: boxes.map((b) => ({ bbox_xyxy_pixels: b.bbox_xyxy_pixels, verified_result: b.verified_result })) }),
       });
-      setMessage('Annotations saved to PostgreSQL.');
       setDirtyImageId(null);
+      setUndoStack([]); setRedoStack([]);
       setImages((all) => all.map((item) => item.id === current.id ? { ...item, verified: false, review_status: saved.image.review_status, verified_at: null } : item));
       setBoxes((saved.image.annotations || []).map((a) => ({ ...a, verified_result: a.verified_result || '' })));
       void refreshDatasetMetrics().catch(() => undefined);
-    } catch (e) { setMessage((e as Error).message); } finally { setBusy(false); }
+      // Only report success once the backend has confirmed it.
+      setMessage(`Saved to PostgreSQL. Status is now "${saved.image.review_status.replace('_', ' ')}".`);
+      if (andNext) move(1);
+    } catch (e) {
+      setMessage(`Save failed: ${(e as Error).message} Your edits are still unsaved.`);
+    } finally { setBusy(false); }
   };
   const setReviewStatus = async (status: ReviewStatus) => {
     if (!current || dirtyImageId === current.id) return;
@@ -395,76 +390,73 @@ const [verifyView, setVerifyView] = useState<'detection' | 'ocr' | 'samples'>('d
     if (!current) return;
     await setReviewStatus(current.review_status === 'verified' ? 'needs_review' : 'verified');
   };
-  const removeBox = (idx: number) => {
-    setBoxes((all) => all.filter((_, n) => n !== idx));
-    setSelectedBoxIndex((selected) => selected == null || selected === idx ? null : selected > idx ? selected - 1 : selected);
+
+  /** Apply a completed annotation edit and record it as one undo step. */
+  // A drag pushes several live onChange updates; onEditStart captures the state
+  // from before the drag so undo returns there rather than to a mid-drag frame.
+  const commitBoxes = (next: Box[]) => {
+    const base = editSnapshot.current ?? boxes;
+    editSnapshot.current = null;
+    setUndoStack((stack) => [...stack.slice(-49), base]);
+    setRedoStack([]);
+    setBoxes(next);
     if (current) setDirtyImageId(current.id);
   };
-  const point = () => {
-    const p = stageRef.current?.getPointerPosition(); return p ? [p.x / scale, p.y / scale] : null;
+  const beginEdit = () => { editSnapshot.current = boxes; };
+  const undo = () => {
+    if (!undoStack.length) return;
+    const previous = undoStack[undoStack.length - 1];
+    setRedoStack((stack) => [boxes, ...stack].slice(0, 50));
+    setUndoStack((stack) => stack.slice(0, -1));
+    setBoxes(previous);
+    if (current) setDirtyImageId(current.id);
+    setMessage('Undid the last annotation change.');
   };
-  const startDraw = (event: Konva.KonvaEventObject<MouseEvent>) => {
-    if (!current || event.target !== stageRef.current) return;
-    const p = point(); if (p) setDrawing([p[0], p[1], p[0], p[1]]);
+  const redo = () => {
+    if (!redoStack.length) return;
+    const next = redoStack[0];
+    setUndoStack((stack) => [...stack, boxes].slice(-50));
+    setRedoStack((stack) => stack.slice(1));
+    setBoxes(next);
+    if (current) setDirtyImageId(current.id);
+    setMessage('Redid the annotation change.');
   };
-  const updateDraw = () => { if (!drawing || !stageRef.current) return; const p = point(); if (p) setDrawing([drawing[0], drawing[1], p[0], p[1]]); };
-  const endDraw = () => {
-    if (!drawing) return;
-    const box = [Math.min(drawing[0], drawing[2]), Math.min(drawing[1], drawing[3]), Math.max(drawing[0], drawing[2]), Math.max(drawing[1], drawing[3])];
-    if (box[2] - box[0] >= 3 && box[3] - box[1] >= 3) {
-      setBoxes((old) => [...old, { bbox_xyxy_pixels: box, verified_result: '', ai_detection: false }]);
-      setSelectedBoxIndex(boxes.length);
-      if (current) setDirtyImageId(current.id);
-    }
-    setDrawing(null);
+  /** Guard navigation so unsaved box edits are never silently dropped. */
+  const hasUnsaved = !!current && dirtyImageId === current.id;
+  const removeBox = (idx: number) => {
+    commitBoxes(boxes.filter((_, n) => n !== idx));
+    setSelectedBoxIndex((selected) => selected == null || selected === idx ? null : selected > idx ? selected - 1 : selected);
   };
   const setText = (idx: number, text: string) => {
     setBoxes((all) => all.map((box, i) => i === idx ? { ...box, verified_result: text } : box));
     if (current) setDirtyImageId(current.id);
-  };
-  const moveBox = (idx: number, x: number, y: number) => {
-    if (!current) return;
-    setBoxes((all) => all.map((box, i) => {
-      if (i !== idx) return box;
-      const [x1, y1, x2, y2] = box.bbox_xyxy_pixels;
-      const width = x2 - x1, height = y2 - y1;
-      const left = Math.max(0, Math.min(current.width - width, x / scale));
-      const top = Math.max(0, Math.min(current.height - height, y / scale));
-      return { ...box, bbox_xyxy_pixels: [left, top, left + width, top + height] };
-    }));
-    setDirtyImageId(current.id);
-  };
-  const resizeBoxCorner = (idx: number, corner: number, x: number, y: number) => {
-    if (!current) return;
-    setBoxes((all) => all.map((box, i) => {
-      if (i !== idx) return box;
-      const coords = [...box.bbox_xyxy_pixels];
-      const moveLeft = corner === 0 || corner === 2;
-      const moveTop = corner === 0 || corner === 1;
-      const xIndex = moveLeft ? 0 : 2;
-      const yIndex = moveTop ? 1 : 3;
-      coords[xIndex] = Math.max(0, Math.min(current.width, x / scale));
-      coords[yIndex] = Math.max(0, Math.min(current.height, y / scale));
-      const left = Math.min(coords[0], coords[2]), right = Math.max(coords[0], coords[2]);
-      const top = Math.min(coords[1], coords[3]), bottom = Math.max(coords[1], coords[3]);
-      if (right - left < 2 || bottom - top < 2) return box;
-      return { ...box, bbox_xyxy_pixels: [left, top, right, bottom] };
-    }));
-    setDirtyImageId(current.id);
   };
 
   useEffect(() => {
     const handleShortcut = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
       const editing = !!target?.closest('input, textarea, select, [contenteditable="true"]');
-      if (section !== 'production') return;
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
-        event.preventDefault(); void save(); return;
+      if (section !== 'production' || verifyView !== 'detection') return;
+      const modifier = event.ctrlKey || event.metaKey;
+      if (modifier && event.key.toLowerCase() === 's') {
+        event.preventDefault(); void save(event.shiftKey); return;
       }
-      if (editing || event.altKey || event.ctrlKey || event.metaKey) return;
+      // Undo/redo run even from a text field, but never touch server-side state.
+      if (modifier && event.key.toLowerCase() === 'z') {
+        event.preventDefault();
+        if (event.shiftKey) redo(); else undo();
+        return;
+      }
+      // Never hijack keys while the user is typing.
+      if (editing || event.altKey || modifier) return;
       if (event.key === 'ArrowRight' || event.key.toLowerCase() === 'n') { event.preventDefault(); move(1); }
       else if (event.key === 'ArrowLeft' || event.key.toLowerCase() === 'p') { event.preventDefault(); move(-1); }
       else if (event.key.toLowerCase() === 'v') { event.preventDefault(); void markVerified(); }
+      else if (event.key.toLowerCase() === 'f') { event.preventDefault(); canvasApi.current?.fit(); }
+      else if (event.key === '=' || event.key === '+') { event.preventDefault(); canvasApi.current?.zoomBy(1.25); }
+      else if (event.key === '-' || event.key === '_') { event.preventDefault(); canvasApi.current?.zoomBy(1 / 1.25); }
+      else if (event.key.toLowerCase() === 'd') { event.preventDefault(); setMode((m) => (m === 'draw' ? 'select' : 'draw')); }
+      else if (event.key === 'Escape') { event.preventDefault(); setSelectedBoxIndex(null); }
       else if (event.key.toLowerCase() === 't') {
         event.preventDefault();
         const idx = selectedBoxIndex ?? (boxes.length ? 0 : null);
@@ -475,13 +467,27 @@ const [verifyView, setVerifyView] = useState<'detection' | 'ocr' | 'samples'>('d
     };
     window.addEventListener('keydown', handleShortcut);
     return () => window.removeEventListener('keydown', handleShortcut);
-  }, [section, current?.id, boxes.length, selectedBoxIndex, save, markVerified, move, removeBox]);
+  }, [section, verifyView, current?.id, boxes.length, selectedBoxIndex, save, markVerified, move, removeBox, undo, redo]);
 
   const renderTrainingSection = (type: 'detector' | 'ocr', trained: TrainingJob | null) => {
     const isOcr = type === 'ocr';
     const isActive = trained?.status === 'queued' || trained?.status === 'running';
     const otherTrainingActive = [detectorTrainingJob, ocrTrainingJob].some((item) => item?.model_type !== type && (item?.status === 'queued' || item?.status === 'running'));
     const units = isOcr ? 'plate crops' : 'images';
+    // Only one split runs at a time. The backend resets a split's counter only
+    // when that split actually starts, so a finished counter otherwise sits at
+    // 100% for the rest of the epoch and looks like it is stuck.
+    const valTotal = trained?.total_val || trained?.split_counts.val || 0;
+    const testTotal = trained?.total_test || trained?.split_counts.test || 0;
+    const valDone = trained?.current_val || 0;
+    const testDone = trained?.current_test || 0;
+    const batchesTotal = trained?.total_batches || 0;
+    const trainingNow = !!isActive && batchesTotal > 0 && (trained?.current_batch || 0) < batchesTotal;
+    const validatingNow = !!isActive && !trainingNow && valTotal > 0 && valDone < valTotal;
+    const phase = !isActive ? (trained?.status || 'idle')
+      : trainingNow ? 'Training'
+        : validatingNow ? 'Validating'
+          : 'Between epochs — saving metrics';
     return <section className={`training-page ${isOcr ? 'ocr-training-page' : 'detector-training-page'}`}>
       <header className="training-page-head">
         <div><h2>{isOcr ? 'OCR training' : 'Detection training'}</h2>
@@ -496,6 +502,7 @@ const [verifyView, setVerifyView] = useState<'detection' | 'ocr' | 'samples'>('d
         <button type="button" onClick={() => void createSnapshot(type)} disabled={busy}>Create snapshot</button>
         <label>Epochs<input type="number" min="1" max="300" value={trainingConfig.epochs} onChange={(e) => setTrainingConfig({ ...trainingConfig, epochs: Number(e.target.value) })} /></label>
         <label>Batch size<input type="number" min="1" max="64" value={trainingConfig.batch_size} onChange={(e) => setTrainingConfig({ ...trainingConfig, batch_size: Number(e.target.value) })} /></label>
+        <label title="Background processes that load and prepare batches in parallel. More workers can speed up training, but each uses extra memory; 0 loads everything in the main process.">Workers<input type="number" min="0" max="16" value={trainingConfig.workers} onChange={(e) => setTrainingConfig({ ...trainingConfig, workers: Math.max(0, Number(e.target.value)) })} /></label>
         {!isOcr && <label>Image size<input type="number" min="320" max="1280" step="32" value={trainingConfig.image_size} onChange={(e) => setTrainingConfig({ ...trainingConfig, image_size: Number(e.target.value) })} /></label>}
         <button className="primary" type="submit" disabled={busy || isActive || otherTrainingActive || !selectedSnapshot[type]}>Start {isOcr ? 'OCR' : 'detector'} training</button>
       </form>
@@ -510,18 +517,28 @@ const [verifyView, setVerifyView] = useState<'detection' | 'ocr' | 'samples'>('d
       {isOcr && <OCRDatasetReview />}
       {trained ? <section className="training-status" aria-live="polite">
         <div className="training-status-head"><strong>{isOcr ? 'OCR' : 'Detector'} · {trained.status}</strong>
+          {isActive && <span className="training-phase" aria-label="Current stage">Now: {phase}</span>}
           {isActive && <button className="stop-training" onClick={() => void cancelTraining(trained)} disabled={busy || trained.cancel_requested}>{trained.cancel_requested ? 'Stopping…' : 'Stop training'}</button>}
         </div>
         {trained.split_counts && Object.keys(trained.split_counts).length > 0 && <div className="training-splits">
-          <label>Train · epoch {trained.current_epoch} / {trained.total_epochs} · batch {trained.total_batches ? `${trained.current_batch} / ${trained.total_batches}` : 'preparing'} · {Math.min(trained.split_counts.train || 0, trained.current_batch * trained.config.batch_size).toLocaleString()} / {(trained.split_counts.train || 0).toLocaleString()} {units} this epoch
-            <progress value={Math.min(trained.split_counts.train || 0, trained.current_batch * trained.config.batch_size)} max={trained.split_counts.train || 1} />
-          </label>
-          <label>Validation · {Math.min(trained.current_val || 0, trained.total_val || trained.split_counts.val || 0).toLocaleString()} / {(trained.total_val || trained.split_counts.val || 0).toLocaleString()} {units}
-            <progress value={trained.current_val || 0} max={trained.total_val || trained.split_counts.val || 1} />
-          </label>
-          <label>Test · {Math.min(trained.current_test || 0, trained.total_test || trained.split_counts.test || 0).toLocaleString()} / {(trained.total_test || trained.split_counts.test || 0).toLocaleString()} {units}
-            <progress value={trained.current_test || 0} max={trained.total_test || trained.split_counts.test || 1} />
-          </label>
+          <div className={`split-row ${trainingNow ? 'is-running' : isActive ? 'is-idle' : ''}`}>
+            <label>Train · epoch {trained.current_epoch} / {trained.total_epochs} · batch {trained.total_batches ? `${trained.current_batch} / ${trained.total_batches}` : 'preparing'} · {Math.min(trained.split_counts.train || 0, trained.current_batch * trained.config.batch_size).toLocaleString()} / {(trained.split_counts.train || 0).toLocaleString()} {units} this epoch
+              <progress value={Math.min(trained.split_counts.train || 0, trained.current_batch * trained.config.batch_size)} max={trained.split_counts.train || 1} />
+            </label>
+            <span className="split-state">{trainingNow ? 'running' : !isActive ? 'finished' : 'not running now'}</span>
+          </div>
+          <div className={`split-row ${validatingNow ? 'is-running' : valDone >= valTotal && valTotal > 0 ? 'is-done' : 'is-idle'}`}>
+            <label>Validation · {validatingNow ? `${valDone.toLocaleString()} / ${valTotal.toLocaleString()} ${units}` : valDone >= valTotal && valTotal > 0 ? `${valTotal.toLocaleString()} ${units} checked at the end of the last epoch` : `runs after each training epoch · ${valTotal.toLocaleString()} ${units} queued`}
+              <progress value={valDone} max={valTotal || 1} />
+            </label>
+            <span className="split-state">{validatingNow ? 'running' : valDone >= valTotal && valTotal > 0 ? 'complete' : 'idle'}</span>
+          </div>
+          <div className={`split-row ${testDone >= testTotal && testTotal > 0 ? 'is-done' : 'is-idle'}`}>
+            <label>Test · {testDone >= testTotal && testTotal > 0 ? `${testTotal.toLocaleString()} ${units} checked at the end of training` : `runs once, after training finishes · ${testTotal.toLocaleString()} ${units} queued`}
+              <progress value={testDone} max={testTotal || 1} />
+            </label>
+            <span className="split-state">{testDone >= testTotal && testTotal > 0 ? 'complete' : 'idle'}</span>
+          </div>
         </div>}
         {trained.cancel_requested && isActive && <span>Stop requested. Waiting for the current batch to finish…</span>}
         {!isOcr && trained.metrics['metrics/mAP50(B)'] != null && <div className="training-metric-grid">
@@ -557,6 +574,7 @@ const [verifyView, setVerifyView] = useState<'detection' | 'ocr' | 'samples'>('d
         {([['production', 'Verify Datasets'], ['detector', 'Train Detection'], ['ocr', 'Train OCR'], ['recognition', 'Recognition / Test']] as const).map(([id, label]) => <button key={id} className={section === id ? 'active' : ''} onClick={() => { setSection(id); setMessage(''); }}>{label}</button>)}
       </nav>
     </header>
+    <div className="app-body">
     {section === 'production' && <>
     <div className="production-heading"><div><h2>Verify Datasets</h2><p>Detection and OCR need different ground truth, so they are verified separately.</p></div>
       <div className="snapshot-actions">
@@ -619,32 +637,51 @@ const [verifyView, setVerifyView] = useState<'detection' | 'ocr' | 'samples'>('d
         <button type="submit" disabled={!imageTotal || busy}>Go</button>
       </form>
       <span className="filename">{current?.filename || (source === 'datasets_folder' ? 'No images found — click "Sync from datasets/ folder" to scan.' : 'Import images into datasets/raw/')}</span>
-      <div className="zoom-controls" aria-label="Image zoom controls">
-        <button aria-label="Zoom out" title="Zoom out" onClick={() => setZoom((value) => Math.max(0.25, Math.round((value - 0.25) * 100) / 100))} disabled={zoom <= 0.25}>−</button>
-        <span>{Math.round(zoom * 100)}%</span>
-        <button aria-label="Zoom in" title="Zoom in" onClick={() => setZoom((value) => Math.min(4, Math.round((value + 0.25) * 100) / 100))} disabled={zoom >= 4}>+</button>
-        <button onClick={() => setZoom(1)} disabled={zoom === 1}>Fit</button>
+      <div className="canvas-toolbar" role="toolbar" aria-label="Canvas tools">
+        <div className="mode-toggle" role="group" aria-label="Interaction mode">
+          <button type="button" aria-pressed={mode === 'select'} className={mode === 'select' ? 'active' : ''}
+            onClick={() => setMode('select')} title="Select mode: pick, move and resize existing boxes (V toggles)">Select</button>
+          <button type="button" aria-pressed={mode === 'draw'} className={mode === 'draw' ? 'active' : ''}
+            onClick={() => setMode('draw')} title="Draw mode: drag empty space to add a plate box (V toggles)">Draw</button>
+        </div>
+        <div className="zoom-controls" aria-label="Image zoom controls">
+          <button aria-label="Zoom out" title="Zoom out (−)" onClick={() => canvasApi.current?.zoomBy(1 / 1.25)}>−</button>
+          <button aria-label="Zoom in" title="Zoom in (+)" onClick={() => canvasApi.current?.zoomBy(1.25)}>+</button>
+          <button onClick={() => canvasApi.current?.fit()} title="Fit image to screen (F)">Fit</button>
+          <span aria-live="polite">{zoomLabel}%</span>
+        </div>
+        <div className="mode-toggle" role="group" aria-label="History">
+          <button type="button" onClick={undo} disabled={!undoStack.length} title="Undo (Ctrl/⌘+Z)">Undo</button>
+          <button type="button" onClick={redo} disabled={!redoStack.length} title="Redo (Ctrl/⌘+Shift+Z)">Redo</button>
+        </div>
+        {selectedBoxIndex != null && <button type="button" className="danger"
+          onClick={() => { removeBox(selectedBoxIndex); setSelectedBoxIndex(null); }}
+          title="Delete selected box (Delete)">Delete box</button>}
+        <span className="shortcut-hint">Wheel zoom · Space+drag or middle-drag pan · V mode · F fit · Del remove</span>
       </div>
       {current && dirtyImageId === current.id && <span className="verify-badge pending">Unsaved edits</span>}
       <button className="primary" onClick={() => detect(false)} disabled={busy || jobActive || anyTrainingActive || !current}>Auto detect</button>
-      <button className="primary" onClick={save} disabled={busy || !current}>Save labels</button>
+      <button className="primary" onClick={() => void save(false)} disabled={busy || !current || !hasUnsaved}>Save</button>
+      <button className="primary" onClick={() => void save(true)} disabled={busy || !current || !hasUnsaved}>Save &amp; Next</button>
     </section>
     <section className="workspace">
-      <div className="canvas-wrap">
-        {current && imageEl ? <Stage ref={stageRef} width={stageSize.width * zoom} height={stageSize.height * zoom} onMouseDown={startDraw} onMouseMove={updateDraw} onMouseUp={endDraw} onTouchStart={startDraw as never} onTouchMove={updateDraw} onTouchEnd={endDraw}>
-          <Layer><KImage image={imageEl} width={current.width * scale} height={current.height * scale} listening={false} />
-            {boxes.map((box, i) => { const [x1,y1,x2,y2] = box.bbox_xyxy_pixels; const handles = [[x1,y1],[x2,y1],[x1,y2],[x2,y2]]; return <Fragment key={i}>
-              <Rect x={x1*scale} y={y1*scale} width={(x2-x1)*scale} height={(y2-y1)*scale} stroke={box.ai_detection ? '#f59e0b' : '#16a34a'} strokeWidth={2} draggable onClick={() => setSelectedBoxIndex(i)} onTap={() => setSelectedBoxIndex(i)} onDragStart={() => setSelectedBoxIndex(i)} onDragEnd={(e) => moveBox(i, e.target.x(), e.target.y())} onContextMenu={(e) => { e.evt.preventDefault(); removeBox(i); }} />
-              <Text x={x1*scale} y={Math.max(0,y1*scale-21)} text={box.ai_result || box.verified_result || `Plate ${i+1}`} fontSize={14} fill="white" padding={3} listening={false} />
-              {selectedBoxIndex === i && handles.map(([hx, hy], corner) => <Circle key={corner} x={hx*scale} y={hy*scale} radius={6} fill="#38bdf8" stroke="#e0f2fe" strokeWidth={1} draggable onMouseDown={(e) => e.cancelBubble = true} onTouchStart={(e) => e.cancelBubble = true} onDragEnd={(e) => resizeBoxCorner(i, corner, e.target.x(), e.target.y())} />)}
-            </Fragment>; })}
-            {drawing && <Rect x={Math.min(drawing[0],drawing[2])*scale} y={Math.min(drawing[1],drawing[3])*scale} width={Math.abs(drawing[2]-drawing[0])*scale} height={Math.abs(drawing[3]-drawing[1])*scale} stroke="#38bdf8" dash={[5,3]} />}
-          </Layer>
-        </Stage> : <div className="empty">{current ? 'Loading image…' : (source === 'datasets_folder' ? 'No images loaded. Click "Sync from datasets/ folder" above.' : 'No registered images found. Import a dataset into datasets/raw/ first.')}</div>}
-      </div>
-      <aside className="side-panel"><h2>Plate annotations <span>{boxes.length}</span></h2><p className="hint">Draw a box on the image. Right-click a box row to remove it.</p>
-        <div className="annotation-list">{boxes.map((box, i) => <article className="annotation" key={i} onContextMenu={(e) => { e.preventDefault(); removeBox(i); }}>
-          <div className="annotation-head"><strong>Plate {i + 1}</strong><span className={box.ai_detection ? 'ai-tag' : 'manual-tag'}>{box.ai_detection ? 'AI' : 'Manual'}</span></div>
+      {current ? (imageEl
+        ? <AnnotationCanvas ref={canvasApi} imageEl={imageEl} image={current} boxes={boxes} selectedIndex={selectedBoxIndex}
+          mode={mode} disabled={busy} onZoomChange={setZoomLabel}
+          onSelect={setSelectedBoxIndex} onEditStart={beginEdit} onChange={setBoxes} onCommit={commitBoxes} />
+        : <div className="empty">Loading image…</div>)
+        : <div className="empty">{source === 'datasets_folder' ? 'No images loaded. Click "Sync datasets/imports/" above.' : 'No registered images found. Import a dataset into datasets/raw/ first.'}</div>}
+      <aside className="side-panel"><h2>Plate annotations <span>{boxes.length}</span></h2>
+        <p className="hint">Drag on the image to add a plate. Click a box or a row to select it, then drag to move or pull a corner to resize.</p>
+        <div className="annotation-list">{boxes.map((box, i) => <article key={i}
+          className={`annotation ${selectedBoxIndex === i ? 'is-selected' : ''}`}
+          onClick={() => setSelectedBoxIndex(i)} onContextMenu={(e) => { e.preventDefault(); removeBox(i); }}>
+          <div className="annotation-head"><strong>Plate {i + 1}</strong>
+            <span className={box.ai_detection ? 'ai-tag' : 'manual-tag'}>{box.ai_detection ? 'AI' : 'Manual'}</span>
+            <button type="button" className="annotation-delete" aria-label={`Delete plate ${i + 1}`}
+              title="Delete this box" onClick={(e) => { e.stopPropagation(); removeBox(i); }}>×</button>
+          </div>
+          <span className="annotation-coords">[{box.bbox_xyxy_pixels.map((v) => Math.round(v)).join(', ')}]</span>
           <PlateCrop image={imageEl} box={box.bbox_xyxy_pixels} />
           <label>Verified plate text<input ref={(element) => { ocrInputRefs.current[i] = element; }} onFocus={() => setSelectedBoxIndex(i)} value={box.verified_result} onChange={(e) => setText(i, e.target.value.toUpperCase())} placeholder={box.ai_result || 'Enter text'} /></label>
           {box.ai_detection && <div className="stats"><span>AI guess <b>{box.ai_result || '—'}</b></span><span>OCR confidence <b>{percent(box.ocr_confidence)}</b></span><span>Detection confidence <b>{percent(box.detection_confidence)}</b></span><span>Country <b>{box.country || 'Unknown'} · {percent(box.country_confidence)}</b></span></div>}
@@ -660,5 +697,6 @@ const [verifyView, setVerifyView] = useState<'detection' | 'ocr' | 'samples'>('d
     {section === 'ocr' && renderTrainingSection('ocr', ocrTrainingJob)}
     {section === 'recognition' && <RecognitionTest />}
     {message && section !== 'production' && <div className="status" role="status">{message}</div>}
+    </div>
   </main>;
 }
