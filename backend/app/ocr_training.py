@@ -471,9 +471,12 @@ def run_ocr_training(job_id: str, config: dict):
         )
         train_rows, val_rows, test_rows = splits["train"], splits["val"], splits["test"]
         batch_size = int(config["batch_size"])
-        train_loader = DataLoader(PlateCropDataset(train_rows), batch_size=batch_size, shuffle=True, collate_fn=_collate)
-        val_loader = DataLoader(PlateCropDataset(val_rows), batch_size=batch_size, shuffle=False, collate_fn=_collate)
-        test_loader = DataLoader(PlateCropDataset(test_rows), batch_size=batch_size, shuffle=False, collate_fn=_collate)
+        # Worker processes for loading and preparing crops. Defaults to 2 for
+        # jobs queued before the parameter existed.
+        num_workers = max(0, int(config.get("workers", 2) or 0))
+        train_loader = DataLoader(PlateCropDataset(train_rows), batch_size=batch_size, shuffle=True, collate_fn=_collate, num_workers=num_workers)
+        val_loader = DataLoader(PlateCropDataset(val_rows), batch_size=batch_size, shuffle=False, collate_fn=_collate, num_workers=num_workers)
+        test_loader = DataLoader(PlateCropDataset(test_rows), batch_size=batch_size, shuffle=False, collate_fn=_collate, num_workers=num_workers)
         configured_device = config.get("device", "auto")
         if configured_device == "auto":
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

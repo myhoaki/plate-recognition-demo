@@ -365,7 +365,9 @@ def run_training_job(job_id: str):
             project=str(run_dir),
             name="detector",
             exist_ok=True,
-            workers=2,
+            # DataLoader worker processes. Defaults to 2 for jobs queued before
+            # the parameter existed.
+            workers=int(config.get("workers", 2) or 0),
             seed=42,
             plots=False,
             verbose=False,

@@ -55,6 +55,7 @@ class StartTraining(BaseModel):
     dataset_snapshot_id: str = Field(min_length=32, max_length=32)
     epochs: int = Field(default=30, ge=1, le=300)
     batch_size: int = Field(default=8, ge=1, le=64)
+    workers: int = Field(default=2, ge=0, le=16)
     image_size: int = Field(default=640, ge=320, le=1280, multiple_of=32)
     device: str = Field(default="auto", pattern=r"^(auto|cpu|0|[1-9][0-9]*)$")
     train_ratio: float = Field(default=0.8, gt=0.0, lt=1.0)
